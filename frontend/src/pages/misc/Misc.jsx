@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Plus, FolderKanban, LifeBuoy, FileArchive, ScrollText } from "lucide-react";
+import { Plus, FolderKanban, LifeBuoy, FileArchive, ScrollText, Trash2 } from "lucide-react";
 import { motion } from "framer-motion";
 import api, { fmtDate, fmtInr } from "@/lib/glc";
 import { PageHeader, DataGrid, StatusBadge, EmptyState } from "@/components/common/GlcUI";
@@ -153,23 +153,80 @@ export function Tickets() {
 // ---------- Documents ----------
 export function Documents() {
   const [rows, setRows] = useState([]);
-  useEffect(() => { api.get("/documents").then((r) => setRows(r.data.items || [])); }, []);
+  const [uploading, setUploading] = useState(false);
+  const [category, setCategory] = useState("GENERAL");
+  const [q, setQ] = useState("");
+  const fileRef = React.useRef(null);
+  const load = () => api.get("/documents").then((r) => setRows(r.data.items || []));
+  useEffect(load, []);
+
+  const upload = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    setUploading(true);
+    try {
+      for (const f of files) {
+        const fd = new FormData();
+        fd.append("file", f);
+        await api.post(`/documents/upload?category=${encodeURIComponent(category)}`, fd, { headers: { "Content-Type": "multipart/form-data" } });
+      }
+      toast.success(`${files.length} file(s) uploaded`);
+      load();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Upload failed");
+    }
+    setUploading(false);
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const del = async (d) => {
+    if (!window.confirm(`Delete ${d.name}?`)) return;
+    await api.delete(`/documents/${d.id}`);
+    toast.success("Deleted");
+    load();
+  };
+
+  const download = (d) => {
+    const token = localStorage.getItem("glc_token");
+    const url = `${process.env.REACT_APP_BACKEND_URL}/api/documents/${d.id}/download?auth=${encodeURIComponent(token)}`;
+    window.open(url, "_blank");
+  };
 
   const CAT_STYLE = { LEGAL: "bg-rose-50 text-rose-700", HR: "bg-emerald-50 text-emerald-700", FINANCE: "bg-amber-50 text-amber-700", VENDOR: "bg-blue-50 text-blue-700", GENERAL: "bg-slate-100 text-slate-700" };
+  const CATS = ["GENERAL", "LEGAL", "HR", "FINANCE", "VENDOR"];
+  const filtered = rows.filter((r) => (!q || (r.name || "").toLowerCase().includes(q.toLowerCase())) && !r.isDeleted);
 
   return (
     <div className="space-y-6">
-      <PageHeader testId="documents-page" title="Document Vault" subtitle="Centralised business documents with categories" />
-      {rows.length === 0 ? <EmptyState icon={FileArchive} title="No documents yet" /> : (
-        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4">
-          {rows.map((d) => (
+      <PageHeader testId="documents-page" title="Document Vault" subtitle="Real object-storage-backed document repository" actions={
+        <div className="flex items-center gap-2">
+          <select value={category} onChange={(e) => setCategory(e.target.value)} className="h-10 px-3 rounded-lg border border-slate-200 text-[13px] bg-white">
+            {CATS.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <input ref={fileRef} type="file" onChange={upload} className="hidden" id="doc-upload" data-testid="doc-file-input" multiple />
+          <label htmlFor="doc-upload" data-testid="doc-upload-btn" className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium cursor-pointer ${uploading ? "bg-slate-200 text-slate-500" : "bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"}`}>
+            {uploading ? "Uploading…" : "+ Upload"}
+          </label>
+        </div>
+      }/>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search documents…" className="w-full max-w-sm h-10 px-3 rounded-lg bg-white border border-slate-200 text-[13px]" data-testid="doc-search" />
+      {filtered.length === 0 ? <EmptyState icon={FileArchive} title="No documents yet" description="Upload PDFs, images, spreadsheets — up to 50MB per file." /> : (
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4" data-testid="documents-grid">
+          {filtered.map((d) => (
             <div key={d.id} className="bg-white rounded-2xl border border-slate-200/70 card-elev p-4 hover:-translate-y-0.5 transition-transform">
               <div className="w-10 h-10 rounded-lg bg-slate-100 grid place-items-center text-slate-500 mb-3">
                 <FileArchive size={18} />
               </div>
-              <div className="text-[13.5px] font-medium text-slate-900 truncate">{d.name}</div>
+              <div className="text-[13.5px] font-medium text-slate-900 truncate" title={d.name}>{d.name}</div>
               <div className="text-[11px] text-slate-500 mt-0.5">{d.uploadedBy} · {fmtDate(d.createdAt)}</div>
-              <div className="mt-3"><span className={`inline-block text-[10.5px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full ${CAT_STYLE[d.category] || CAT_STYLE.GENERAL}`}>{d.category}</span></div>
+              {d.size && <div className="text-[10.5px] text-slate-400 mt-0.5">{(d.size / 1024).toFixed(1)} KB</div>}
+              <div className="mt-3 flex items-center justify-between">
+                <span className={`inline-block text-[10.5px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full ${CAT_STYLE[d.category] || CAT_STYLE.GENERAL}`}>{d.category}</span>
+                <div className="flex items-center gap-1">
+                  {d.storage_path && <button data-testid={`doc-download-${d.id}`} onClick={() => download(d)} className="text-[11.5px] font-medium text-[hsl(var(--primary))] hover:underline">Download</button>}
+                  <button data-testid={`doc-delete-${d.id}`} onClick={() => del(d)} className="text-slate-400 hover:text-rose-600 p-1"><Trash2 size={12} /></button>
+                </div>
+              </div>
             </div>
           ))}
         </div>

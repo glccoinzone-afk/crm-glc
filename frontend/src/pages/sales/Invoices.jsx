@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
-import { Receipt, IndianRupee } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { Receipt, IndianRupee, Printer } from "lucide-react";
+import { useReactToPrint } from "react-to-print";
 import api, { fmtInr, fmtDate } from "@/lib/glc";
 import { PageHeader, DataGrid, EmptyState, StatusBadge } from "@/components/common/GlcUI";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -93,6 +94,24 @@ export default function Invoices() {
 }
 
 function InvoiceView({ inv }) {
+  const printRef = useRef(null);
+  const print = useReactToPrint({ contentRef: printRef, documentTitle: inv.invoiceNo });
+  return (
+    <div>
+      <div className="flex items-center justify-between px-6 pt-5 pb-3 border-b border-slate-100">
+        <div className="text-[13px] font-semibold text-slate-500">Invoice Preview</div>
+        <button data-testid="invoice-print" onClick={print} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90">
+          <Printer size={13} /> Print / PDF
+        </button>
+      </div>
+      <div ref={printRef}>
+        <InvoiceBody inv={inv} />
+      </div>
+    </div>
+  );
+}
+
+function InvoiceBody({ inv }) {
   return (
     <div className="p-8 bg-white">
       <div className="flex items-start justify-between border-b border-slate-100 pb-5">
@@ -149,6 +168,9 @@ function InvoiceView({ inv }) {
             <span>Total</span><span className="font-mono tabular">{fmtInr(inv.total)}</span>
           </div>
         </div>
+      </div>
+      <div className="mt-8 pt-4 border-t border-slate-100 text-[10.5px] text-slate-400 text-center">
+        This is a computer-generated invoice. Thank you for your business — GLC Zone Private Limited.
       </div>
     </div>
   );

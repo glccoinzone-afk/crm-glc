@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
-import { BarChart3, ScrollText, FileText, Wallet } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { BarChart3, ScrollText, FileText, Wallet, Printer } from "lucide-react";
+import { useReactToPrint } from "react-to-print";
 import api, { fmtInr } from "@/lib/glc";
 import { PageHeader, DataGrid, StatusBadge, EmptyState, StatCard } from "@/components/common/GlcUI";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -84,6 +85,8 @@ export function Journal() {
 export function GstReports() {
   const [data, setData] = useState(null);
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
+  const ref = useRef(null);
+  const print = useReactToPrint({ contentRef: ref, documentTitle: `GSTR-1-${month}` });
   useEffect(() => { api.get("/reports/gst", { params: { month } }).then((r) => setData(r.data)); }, [month]);
   const s = data?.summary || {};
   const columns = [
@@ -99,16 +102,26 @@ export function GstReports() {
   return (
     <div className="space-y-6">
       <PageHeader testId="gst-page" title="GST Reports (GSTR-1 / 3B)" subtitle="Filing-ready outward supplies breakdown" actions={
-        <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} className="h-10 px-3 rounded-lg border border-slate-200 text-[13px] bg-white" />
+        <div className="flex items-center gap-2">
+          <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} className="h-10 px-3 rounded-lg border border-slate-200 text-[13px] bg-white" />
+          <button data-testid="gst-print" onClick={print} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"><Printer size={13} /> Print / PDF</button>
+        </div>
       }/>
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-        <StatCard label="Invoices" value={s.count || 0} icon={FileText} tone="primary" />
-        <StatCard label="Taxable Value" value={fmtInr(s.taxableValue)} icon={BarChart3} tone="accent" />
-        <StatCard label="CGST" value={fmtInr(s.cgst)} icon={ScrollText} tone="warn" />
-        <StatCard label="SGST" value={fmtInr(s.sgst)} icon={ScrollText} tone="warn" />
-        <StatCard label="Total Tax" value={fmtInr((s.cgst||0)+(s.sgst||0)+(s.igst||0))} icon={Wallet} tone="success" />
+      <div ref={ref}>
+        <div className="hidden print:block px-6 pt-6 pb-3 border-b border-slate-200 mb-4">
+          <div className="text-[11px] uppercase tracking-wide text-slate-500">GSTR-1 · Outward Supplies</div>
+          <div className="text-[22px] font-semibold text-slate-900">Period: {month}</div>
+          <div className="text-[12px] text-slate-500 mt-1">GLC Zone Pvt Ltd · GSTIN 07AABCG1234H1Z5 · New Delhi</div>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+          <StatCard label="Invoices" value={s.count || 0} icon={FileText} tone="primary" />
+          <StatCard label="Taxable Value" value={fmtInr(s.taxableValue)} icon={BarChart3} tone="accent" />
+          <StatCard label="CGST" value={fmtInr(s.cgst)} icon={ScrollText} tone="warn" />
+          <StatCard label="SGST" value={fmtInr(s.sgst)} icon={ScrollText} tone="warn" />
+          <StatCard label="Total Tax" value={fmtInr((s.cgst||0)+(s.sgst||0)+(s.igst||0))} icon={Wallet} tone="success" />
+        </div>
+        <DataGrid columns={columns} rows={data?.invoices || []} testId="gst-grid" empty="No invoices for this month." />
       </div>
-      <DataGrid columns={columns} rows={data?.invoices || []} testId="gst-grid" empty="No invoices for this month." />
     </div>
   );
 }

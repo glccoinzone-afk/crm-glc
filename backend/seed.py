@@ -478,3 +478,118 @@ async def seed_all(db):
             {"id": _id(), "userId": "system", "module": "system", "action": "seed", "meta": {"note": "Initial seed complete"}, "createdAt": _now_iso()},
         ]
         await db.audit_logs.insert_many(docs)
+
+    # ---------- OCM: Contacts / Conversations / Messages ----------
+    if await db.ocm_contacts.count_documents({}) == 0:
+        contacts_seed = [
+            ("Arjun Verma", "+91 98765 10001", "arjun@versharetail.in", "arjun_v", "GLC Store", "TELEGRAM,WHATSAPP"),
+            ("Kavya Nair", "+91 98765 10002", "kavya@nairorganic.in", "kavya_n", "GLC Fresh", "WHATSAPP,INSTAGRAM"),
+            ("Rahul Bansal", "+91 98765 10003", "rahul@bansalhw.in", "rahul_b", "GLC Hardwares", "TELEGRAM"),
+            ("Isha Kapoor", "+91 98765 10004", "isha@kapoorjewels.in", "isha_k", "Dhani Jewellers", "INSTAGRAM,FACEBOOK"),
+            ("Neel Joshi", "+91 98765 10005", "neel@joshigreens.in", "neel_j", "GLC Garden", "WEBCHAT"),
+            ("Divya Menon", "+91 98765 10006", "divya@menonfarms.in", "divya_m", "India Mandi", "TELEGRAM,WHATSAPP"),
+            ("Aditya Rao", "+91 98765 10007", "aditya@raorealty.in", "aditya_r", "GLC Property", "WHATSAPP"),
+            ("Simran Kaur", "+91 98765 10008", "simran@kaurlaw.in", "simran_k", "GLC Legal", "WEBCHAT,WHATSAPP"),
+            ("Manoj Tiwari", "+91 98765 10009", "manoj@tgrocers.in", "manoj_t", "GLC Store", "TELEGRAM"),
+            ("Pooja Shah", "+91 98765 10010", "pooja@shahfresh.in", "pooja_s", "GLC Fresh", "WHATSAPP,INSTAGRAM"),
+        ]
+        docs = []
+        for (n, p, e, tg, v, ch) in contacts_seed:
+            docs.append({
+                "id": _id(), "name": n, "phone": p, "email": e,
+                "telegramId": f"@{tg}", "whatsappId": p, "instagramId": tg,
+                "channels": ch.split(","), "vertical": v,
+                "tags": random.sample(["vip", "prospect", "trader", "distributor", "returning"], k=2),
+                "subscribed": True,
+                "createdAt": _now_iso(), "updatedAt": _now_iso(),
+            })
+        await db.ocm_contacts.insert_many(docs)
+
+    if await db.ocm_conversations.count_documents({}) == 0:
+        contacts = await db.ocm_contacts.find({}, {"_id": 0}).to_list(20)
+        channels = ["TELEGRAM", "WHATSAPP", "INSTAGRAM", "FACEBOOK", "WEBCHAT"]
+        first_msgs = [
+            ("Hi, need pricing for basmati rice 100 bags for shop", "Sure Arjun! Sending a quote via WhatsApp shortly."),
+            ("Kya aap ka mango stock available hai for July?", "Yes Divya ji, Alphonso mangoes available. Rate ₹550/dozen wholesale."),
+            ("Where is my order SO-2026-1005?", "Your order is out for delivery today. OTP 4783 shared with rider."),
+            ("Looking for gold bangle 22K 8gm design catalogue", "Sharing latest designs on WhatsApp now. 15% off till Aug 5th."),
+            ("Do you deliver to Gurgaon Sector 44?", "Yes, we deliver across NCR. Free shipping above ₹999."),
+            ("Bulk pricing for 50 cordless drills for our project", "Sure Rahul. Sending PO-friendly quote — 12% off + 30 day credit."),
+        ]
+        convs = []
+        msgs = []
+        for i, c in enumerate(contacts[:8]):
+            ch = c["channels"][0] if c.get("channels") else random.choice(channels)
+            cid = _id()
+            q, a = random.choice(first_msgs)
+            first_at = (datetime.now(timezone.utc) - timedelta(hours=random.randint(1, 72))).isoformat()
+            second_at = (datetime.now(timezone.utc) - timedelta(minutes=random.randint(5, 240))).isoformat()
+            convs.append({
+                "id": cid, "contactId": c["id"], "contactName": c["name"],
+                "channel": ch, "status": random.choice(["OPEN", "OPEN", "PENDING", "RESOLVED"]),
+                "assignedTo": random.choice(["Danish Ali", "Riddhi Sharma", None]),
+                "unread": random.randint(0, 3), "vertical": c.get("vertical"),
+                "lastMessage": a, "lastMessageAt": second_at,
+                "createdAt": first_at, "updatedAt": second_at,
+            })
+            msgs.append({"id": _id(), "conversationId": cid, "channel": ch, "direction": "IN", "text": q, "sentBy": c["name"], "status": "READ", "createdAt": first_at})
+            msgs.append({"id": _id(), "conversationId": cid, "channel": ch, "direction": "OUT", "text": a, "sentBy": "Danish Ali", "status": "READ", "createdAt": second_at})
+        await db.ocm_conversations.insert_many(convs)
+        await db.ocm_messages.insert_many(msgs)
+
+    if await db.ocm_broadcasts.count_documents({}) == 0:
+        docs = [
+            {"id": _id(), "name": "Diwali Offer — Dhani Jewellers", "channels": ["TELEGRAM", "WHATSAPP", "INSTAGRAM"], "audience": "ALL",
+             "message": "🪔 Diwali Dhamaka! Flat 20% off on all Dhani Jewellers gold & silver. Book by 25 Oct. Reply YES to reserve.",
+             "status": "SENT", "sentAt": _now_iso(), "sentCount": 4820, "deliveredCount": 4562, "readCount": 3011,
+             "createdBy": "Riddhi Sharma", "createdAt": _now_iso()},
+            {"id": _id(), "name": "GLC Fresh — Weekly Rate Update", "channels": ["TELEGRAM"], "audience": "TRADERS",
+             "message": "🌾 Weekly wholesale rates now live on @indiamandirates. Basmati ₹480/kg (5kg pack), Alphonso ₹550/dozen.",
+             "status": "SCHEDULED", "scheduledAt": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(),
+             "sentCount": 0, "createdBy": "Bishwajeet Kumar", "createdAt": _now_iso()},
+            {"id": _id(), "name": "Monsoon Sale — GLC Garden", "channels": ["INSTAGRAM", "FACEBOOK"], "audience": "ALL",
+             "message": "☔ Monsoon is here! Get your Neem, Tulsi, and flowering plants at 25% off. Free potting mix on orders above ₹999.",
+             "status": "DRAFT", "sentCount": 0, "createdBy": "Riddhi Sharma", "createdAt": _now_iso()},
+        ]
+        await db.ocm_broadcasts.insert_many(docs)
+
+    if await db.ocm_flows.count_documents({}) == 0:
+        docs = [
+            {"id": _id(), "name": "Welcome Flow — Telegram", "channel": "TELEGRAM", "trigger": "COMMAND", "triggerValue": "/start", "status": "ACTIVE",
+             "steps": [
+                 {"type": "MESSAGE", "text": "Namaste 🙏 Welcome to GLC Zone! Reply with a number:\n1️⃣ Check rates\n2️⃣ Place order\n3️⃣ Talk to agent"},
+                 {"type": "WAIT_INPUT"},
+                 {"type": "BRANCH", "options": [{"match": "1", "next": "SEND_RATES"}, {"match": "2", "next": "PLACE_ORDER"}, {"match": "3", "next": "HAND_OFF"}]},
+             ], "createdAt": _now_iso()},
+            {"id": _id(), "name": "Abandoned Cart Recovery — WhatsApp", "channel": "WHATSAPP", "trigger": "EVENT", "triggerValue": "cart.abandoned", "status": "ACTIVE",
+             "steps": [
+                 {"type": "WAIT", "hours": 1},
+                 {"type": "MESSAGE", "text": "Hey {name}, you left {product} in your cart. Complete order in the next 2 hours to get 10% off. Use code: COMEBACK10"},
+             ], "createdAt": _now_iso()},
+            {"id": _id(), "name": "OTP on Delivery", "channel": "WHATSAPP", "trigger": "EVENT", "triggerValue": "delivery.dispatch", "status": "ACTIVE",
+             "steps": [
+                 {"type": "MESSAGE", "text": "Your GLC Zone order {orderNo} is out for delivery. Share OTP {otp} with the rider to receive."},
+             ], "createdAt": _now_iso()},
+        ]
+        await db.ocm_flows.insert_many(docs)
+
+    if await db.social_posts.count_documents({}) == 0:
+        posts = []
+        prompts = [
+            ("Fresh Alphonso Mangoes just arrived! 🥭", ["INSTAGRAM", "FACEBOOK"], "SCHEDULED", 2),
+            ("Diwali Sale — up to 20% off on Dhani Jewellers ✨", ["INSTAGRAM", "FACEBOOK", "TELEGRAM"], "SCHEDULED", 5),
+            ("Weekly wholesale mandi rates now live 📊", ["TELEGRAM"], "PUBLISHED", -1),
+            ("Bosch cordless drill — bulk pricing for builders 🔧", ["INSTAGRAM"], "DRAFT", None),
+            ("Neem plants & organic fertilizers 25% off ☘️", ["INSTAGRAM", "FACEBOOK"], "SCHEDULED", 3),
+            ("Legal advisory retainer packages — book a free 15 min call 📋", ["FACEBOOK"], "PUBLISHED", -3),
+        ]
+        for (cap, ch, status, days) in prompts:
+            scheduled_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat() if days is not None else None
+            posts.append({
+                "id": _id(), "caption": cap,
+                "hashtags": random.sample(["#glczone", "#india", "#freshfoods", "#quality", "#offers", "#diwali", "#buylocal", "#mandi", "#retail"], k=5),
+                "channels": ch, "mediaUrl": None, "status": status,
+                "scheduledAt": scheduled_at,
+                "createdBy": "Riddhi Sharma", "createdAt": _now_iso(),
+            })
+        await db.social_posts.insert_many(posts)

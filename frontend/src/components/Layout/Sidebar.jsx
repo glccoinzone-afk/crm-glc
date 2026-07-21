@@ -5,80 +5,101 @@ import {
   LayoutDashboard, Users, UserSquare2, Kanban, FileText, ShoppingCart, Receipt,
   Package, Warehouse, Truck, Building2, ClipboardList, UserRound, CalendarClock,
   Wallet, BarChart3, FolderKanban, LifeBuoy, FileArchive, Settings2, ScrollText,
-  Sparkles
+  Sparkles, MessageSquare, Megaphone, Bot, Send, CalendarDays
 } from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
+import { canAccess } from "@/lib/rbac";
 
 const groups = [
   {
     label: "Overview",
     items: [
-      { to: "/", label: "Dashboard", icon: LayoutDashboard, exact: true },
+      { to: "/", label: "Dashboard", icon: LayoutDashboard, exact: true, mod: "dashboard" },
     ],
   },
   {
     label: "CRM",
     items: [
-      { to: "/crm/leads", label: "Leads", icon: UserSquare2 },
-      { to: "/crm/customers", label: "Customers", icon: Users },
-      { to: "/crm/pipeline", label: "Sales Pipeline", icon: Kanban },
-      { to: "/crm/quotations", label: "Quotations", icon: FileText },
+      { to: "/crm/leads", label: "Leads", icon: UserSquare2, mod: "crm.leads" },
+      { to: "/crm/customers", label: "Customers", icon: Users, mod: "crm.customers" },
+      { to: "/crm/pipeline", label: "Sales Pipeline", icon: Kanban, mod: "crm.pipeline" },
+      { to: "/crm/quotations", label: "Quotations", icon: FileText, mod: "crm.quotations" },
     ],
   },
   {
     label: "Sales",
     items: [
-      { to: "/sales/orders", label: "Orders", icon: ShoppingCart },
-      { to: "/sales/invoices", label: "Invoices", icon: Receipt },
+      { to: "/sales/orders", label: "Orders", icon: ShoppingCart, mod: "sales.orders" },
+      { to: "/sales/invoices", label: "Invoices", icon: Receipt, mod: "sales.invoices" },
     ],
   },
   {
     label: "Inventory & Purchase",
     items: [
-      { to: "/inventory/products", label: "Products", icon: Package },
-      { to: "/inventory/stock", label: "Stock", icon: Warehouse },
-      { to: "/purchase/suppliers", label: "Suppliers", icon: Building2 },
-      { to: "/purchase/orders", label: "Purchase Orders", icon: ClipboardList },
-      { to: "/delivery", label: "Deliveries", icon: Truck },
+      { to: "/inventory/products", label: "Products", icon: Package, mod: "inventory.products" },
+      { to: "/inventory/stock", label: "Stock", icon: Warehouse, mod: "inventory.stock" },
+      { to: "/purchase/suppliers", label: "Suppliers", icon: Building2, mod: "purchase.suppliers" },
+      { to: "/purchase/orders", label: "Purchase Orders", icon: ClipboardList, mod: "purchase.orders" },
+      { to: "/delivery", label: "Deliveries", icon: Truck, mod: "delivery" },
+    ],
+  },
+  {
+    label: "Omnichannel",
+    items: [
+      { to: "/ocm/inbox", label: "Inbox", icon: MessageSquare, mod: "ocm.inbox" },
+      { to: "/ocm/contacts", label: "Contacts", icon: Users, mod: "ocm.contacts" },
+      { to: "/ocm/broadcasts", label: "Broadcasts", icon: Megaphone, mod: "ocm.broadcasts" },
+      { to: "/ocm/flows", label: "Chatbot Flows", icon: Bot, mod: "ocm.flows" },
+      { to: "/ocm/social", label: "Social Scheduler", icon: Send, mod: "ocm.social" },
+      { to: "/ocm/calendar", label: "Content Calendar", icon: CalendarDays, mod: "ocm.calendar" },
     ],
   },
   {
     label: "HR",
     items: [
-      { to: "/hr/employees", label: "Employees", icon: UserRound },
-      { to: "/hr/attendance", label: "Attendance", icon: CalendarClock },
-      { to: "/hr/leaves", label: "Leaves", icon: CalendarClock },
-      { to: "/hr/payroll", label: "Payroll", icon: Wallet },
+      { to: "/hr/employees", label: "Employees", icon: UserRound, mod: "hr.employees" },
+      { to: "/hr/attendance", label: "Attendance", icon: CalendarClock, mod: "hr.attendance" },
+      { to: "/hr/leaves", label: "Leaves", icon: CalendarClock, mod: "hr.leaves" },
+      { to: "/hr/payroll", label: "Payroll", icon: Wallet, mod: "hr.payroll" },
     ],
   },
   {
     label: "Finance",
     items: [
-      { to: "/finance/accounts", label: "Chart of Accounts", icon: BarChart3 },
-      { to: "/finance/journal", label: "Journal", icon: ScrollText },
-      { to: "/finance/gst", label: "GST Reports", icon: FileText },
-      { to: "/finance/expenses", label: "Expenses", icon: Wallet },
+      { to: "/finance/accounts", label: "Chart of Accounts", icon: BarChart3, mod: "finance.accounts" },
+      { to: "/finance/journal", label: "Journal", icon: ScrollText, mod: "finance.journal" },
+      { to: "/finance/gst", label: "GST Reports", icon: FileText, mod: "finance.gst" },
+      { to: "/finance/expenses", label: "Expenses", icon: Wallet, mod: "finance.expenses" },
     ],
   },
   {
     label: "Work",
     items: [
-      { to: "/projects", label: "Projects", icon: FolderKanban },
-      { to: "/tasks", label: "Tasks", icon: Kanban },
-      { to: "/tickets", label: "Support Tickets", icon: LifeBuoy },
-      { to: "/documents", label: "Documents", icon: FileArchive },
+      { to: "/projects", label: "Projects", icon: FolderKanban, mod: "projects" },
+      { to: "/tasks", label: "Tasks", icon: Kanban, mod: "tasks" },
+      { to: "/tickets", label: "Support Tickets", icon: LifeBuoy, mod: "tickets" },
+      { to: "/documents", label: "Documents", icon: FileArchive, mod: "documents" },
     ],
   },
   {
     label: "System",
     items: [
-      { to: "/audit", label: "Audit Log", icon: ScrollText },
-      { to: "/settings", label: "Settings", icon: Settings2 },
+      { to: "/audit", label: "Audit Log", icon: ScrollText, mod: "audit" },
+      { to: "/settings", label: "Settings", icon: Settings2, mod: "settings" },
     ],
   },
 ];
 
 export default function Sidebar() {
   const { pathname } = useLocation();
+  const { user } = useAuth();
+  const role = user?.role || "Admin";
+
+  const visible = groups.map((g) => ({
+    ...g,
+    items: g.items.filter((it) => canAccess(role, it.mod)),
+  })).filter((g) => g.items.length > 0);
+
   return (
     <aside
       data-testid="app-sidebar"
@@ -95,7 +116,7 @@ export default function Sidebar() {
       </div>
 
       <nav className="flex-1 overflow-y-auto px-3 pb-4">
-        {groups.map((g) => (
+        {visible.map((g) => (
           <div key={g.label} className="mb-4">
             <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400 px-3 mb-1.5">
               {g.label}
@@ -127,7 +148,7 @@ export default function Sidebar() {
       </nav>
 
       <div className="px-4 py-3 border-t border-slate-100 text-[11px] text-slate-400">
-        v1.0.0 · India-first ERP
+        v1.1 · India-first ERP + OCM
       </div>
     </aside>
   );

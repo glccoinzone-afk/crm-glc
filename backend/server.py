@@ -12,7 +12,9 @@ import uuid
 import logging
 import bcrypt
 import jwt as pyjwt
+import requests
 from pathlib import Path
+from fastapi import UploadFile, File, Response, Header
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -22,6 +24,42 @@ DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET = os.environ.get("JWT_SECRET", "glc-zone-supersecret-dev-only-change-in-prod")
 JWT_ALGO = "HS256"
 JWT_EXPIRES_MIN = 60 * 24 * 7
+EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+STORAGE_APP_NAME = os.environ.get("STORAGE_APP_NAME", "glczone")
+STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
+_storage_key: Optional[str] = None
+
+
+def init_storage() -> Optional[str]:
+    global _storage_key
+    if _storage_key or not EMERGENT_LLM_KEY:
+        return _storage_key
+    try:
+        r = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_LLM_KEY}, timeout=15)
+        r.raise_for_status()
+        _storage_key = r.json().get("storage_key")
+        return _storage_key
+    except Exception as e:
+        logging.getLogger("glc").exception(f"Storage init failed: {e}")
+        return None
+
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    key = init_storage()
+    if not key:
+        raise HTTPException(500, "Storage not initialized")
+    r = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_object(path: str):
+    key = init_storage()
+    if not key:
+        raise HTTPException(500, "Storage not initialized")
+    r = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
+    r.raise_for_status()
+    return r.content, r.headers.get("Content-Type", "application/octet-stream")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -1462,6 +1500,332 @@ async def dashboard(vertical: Optional[str] = None, user=Depends(current_user)):
 
 
 # =========================================================
+# RBAC — role → allowed modules
+# =========================================================
+ROLE_PERMS = {
+    "Super Admin": ["*"],
+    "Admin": ["*"],
+    "Manager": ["dashboard", "crm", "sales", "inventory", "purchase", "delivery", "projects", "tasks", "tickets", "documents", "settings", "ocm"],
+    "Support Executive": ["dashboard", "crm.customers", "tickets", "documents", "ocm.inbox", "ocm.contacts"],
+    "Sales": ["dashboard", "crm", "sales", "inventory.products", "delivery", "documents", "ocm"],
+    "Accounts": ["dashboard", "sales.invoices", "finance", "purchase", "documents", "hr.payroll"],
+    "HR": ["dashboard", "hr", "documents"],
+}
+
+
+@api.get("/rbac/me")
+async def rbac_me(user=Depends(current_user)):
+    role = user.get("role", "Admin")
+    perms = ROLE_PERMS.get(role, ["dashboard"])
+    return {"role": role, "modules": perms}
+
+
+# =========================================================
+# Documents Vault — real file upload / download via object storage
+# =========================================================
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
+
+
+@api.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...), category: str = "GENERAL", user=Depends(current_user)):
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File exceeds 50MB")
+    ext = (file.filename or "file").rsplit(".", 1)[-1].lower() if "." in (file.filename or "") else "bin"
+    doc_id = uid()
+    path = f"{STORAGE_APP_NAME}/documents/{user['id']}/{doc_id}.{ext}"
+    result = put_object(path, data, file.content_type or "application/octet-stream")
+    rec = {
+        "id": doc_id,
+        "name": file.filename,
+        "storage_path": result["path"],
+        "size": result.get("size", len(data)),
+        "mime": file.content_type or "application/octet-stream",
+        "category": category,
+        "uploadedBy": user["name"],
+        "uploadedById": user["id"],
+        "isDeleted": False,
+        "createdAt": now_iso(),
+    }
+    await db.documents.insert_one(rec)
+    await log_activity(user["id"], "documents", "upload", doc_id, {"name": file.filename, "size": rec["size"]})
+    return clean(rec)
+
+
+@api.get("/documents/{doc_id}/download")
+async def download_document(doc_id: str, auth: Optional[str] = None, cred: HTTPAuthorizationCredentials = Depends(bearer)):
+    # Support token via query param for <a href> and <img src>
+    token = None
+    if cred:
+        token = cred.credentials
+    elif auth:
+        token = auth
+    if not token:
+        raise HTTPException(401, "Missing token")
+    try:
+        pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception:
+        raise HTTPException(401, "Invalid token")
+    rec = await db.documents.find_one({"id": doc_id, "isDeleted": {"$ne": True}}, {"_id": 0})
+    if not rec or not rec.get("storage_path"):
+        raise HTTPException(404, "Not found")
+    data, ctype = get_object(rec["storage_path"])
+    return Response(
+        content=data,
+        media_type=rec.get("mime") or ctype or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{rec.get("name", "file")}"'},
+    )
+
+
+@api.delete("/documents/{doc_id}")
+async def delete_document_v2(doc_id: str, user=Depends(current_user)):
+    await db.documents.update_one({"id": doc_id}, {"$set": {"isDeleted": True, "deletedAt": now_iso()}})
+    await log_activity(user["id"], "documents", "delete", doc_id)
+    return {"ok": True}
+
+
+# =========================================================
+# OCM — Omnichannel Communication Module (Phase 1 MVP)
+# =========================================================
+OCM_CHANNELS = ["TELEGRAM", "WHATSAPP", "INSTAGRAM", "FACEBOOK", "WEBCHAT"]
+
+
+class OcmContactIn(BaseModel):
+    name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    channels: List[str] = []
+    telegramId: Optional[str] = None
+    whatsappId: Optional[str] = None
+    instagramId: Optional[str] = None
+    tags: List[str] = []
+    subscribed: bool = True
+    vertical: Optional[str] = None
+
+
+@api.get("/ocm/contacts")
+async def ocm_list_contacts(page: int = 1, limit: int = 100, q: Optional[str] = None, user=Depends(current_user)):
+    return await paginate(db.ocm_contacts, {}, page, limit, search_fields=["name", "phone", "email"], q=q)
+
+
+@api.post("/ocm/contacts")
+async def ocm_create_contact(data: OcmContactIn, user=Depends(current_user)):
+    doc = {**data.model_dump(), "id": uid(), "createdAt": now_iso(), "updatedAt": now_iso()}
+    await db.ocm_contacts.insert_one(doc)
+    return clean(doc)
+
+
+class OcmMessageIn(BaseModel):
+    conversationId: Optional[str] = None
+    contactId: Optional[str] = None
+    channel: str = "WEBCHAT"
+    text: str
+    direction: str = "OUT"
+
+
+@api.get("/ocm/conversations")
+async def ocm_list_convs(channel: Optional[str] = None, status_: Optional[str] = Query(None, alias="status"), user=Depends(current_user)):
+    filt = {}
+    if channel:
+        filt["channel"] = channel
+    if status_:
+        filt["status"] = status_
+    items = await db.ocm_conversations.find(filt, {"_id": 0}).sort("lastMessageAt", -1).limit(200).to_list(200)
+    return {"items": items}
+
+
+@api.get("/ocm/conversations/{cid}")
+async def ocm_get_conv(cid: str, user=Depends(current_user)):
+    conv = await db.ocm_conversations.find_one({"id": cid}, {"_id": 0})
+    if not conv:
+        raise HTTPException(404, "Not found")
+    msgs = await db.ocm_messages.find({"conversationId": cid}, {"_id": 0}).sort("createdAt", 1).to_list(500)
+    contact = None
+    if conv.get("contactId"):
+        contact = await db.ocm_contacts.find_one({"id": conv["contactId"]}, {"_id": 0})
+    return {"conversation": conv, "messages": msgs, "contact": contact}
+
+
+@api.post("/ocm/conversations/{cid}/messages")
+async def ocm_send_message(cid: str, body: OcmMessageIn, user=Depends(current_user)):
+    conv = await db.ocm_conversations.find_one({"id": cid}, {"_id": 0})
+    if not conv:
+        raise HTTPException(404, "Not found")
+    msg = {
+        "id": uid(),
+        "conversationId": cid,
+        "channel": conv.get("channel", "WEBCHAT"),
+        "direction": body.direction or "OUT",
+        "text": body.text,
+        "sentBy": user["name"],
+        "sentById": user["id"],
+        "status": "SENT",
+        "createdAt": now_iso(),
+    }
+    await db.ocm_messages.insert_one(msg)
+    await db.ocm_conversations.update_one({"id": cid}, {"$set": {"lastMessage": body.text, "lastMessageAt": now_iso()}})
+    return clean(msg)
+
+
+@api.put("/ocm/conversations/{cid}")
+async def ocm_update_conv(cid: str, body: Dict[str, Any], user=Depends(current_user)):
+    body["updatedAt"] = now_iso()
+    await db.ocm_conversations.update_one({"id": cid}, {"$set": body})
+    d = await db.ocm_conversations.find_one({"id": cid}, {"_id": 0})
+    return d
+
+
+class BroadcastIn(BaseModel):
+    name: str
+    channels: List[str] = ["TELEGRAM"]
+    audience: str = "ALL"
+    message: str
+    scheduledAt: Optional[str] = None
+    status: str = "DRAFT"
+
+
+@api.get("/ocm/broadcasts")
+async def ocm_list_broadcasts(user=Depends(current_user)):
+    items = await db.ocm_broadcasts.find({}, {"_id": 0}).sort("createdAt", -1).to_list(200)
+    return {"items": items}
+
+
+@api.post("/ocm/broadcasts")
+async def ocm_create_broadcast(data: BroadcastIn, user=Depends(current_user)):
+    doc = {**data.model_dump(), "id": uid(), "createdAt": now_iso(), "createdBy": user["name"], "sentCount": 0, "deliveredCount": 0, "readCount": 0}
+    await db.ocm_broadcasts.insert_one(doc)
+    return clean(doc)
+
+
+@api.post("/ocm/broadcasts/{bid}/send")
+async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
+    """Mocked send — no external channel calls in this cycle."""
+    b = await db.ocm_broadcasts.find_one({"id": bid}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    n = await db.ocm_contacts.count_documents({"subscribed": True})
+    await db.ocm_broadcasts.update_one({"id": bid}, {"$set": {"status": "SENT", "sentAt": now_iso(), "sentCount": n, "deliveredCount": int(n * 0.94), "readCount": int(n * 0.62)}})
+    await log_activity(user["id"], "ocm.broadcasts", "send", bid, {"channels": b.get("channels"), "recipients": n})
+    return {"ok": True, "recipients": n}
+
+
+class FlowIn(BaseModel):
+    name: str
+    channel: str = "TELEGRAM"
+    trigger: str = "KEYWORD"
+    triggerValue: str = ""
+    steps: List[Dict[str, Any]] = []
+    status: str = "DRAFT"
+
+
+@api.get("/ocm/flows")
+async def ocm_list_flows(user=Depends(current_user)):
+    items = await db.ocm_flows.find({}, {"_id": 0}).sort("createdAt", -1).to_list(200)
+    return {"items": items}
+
+
+@api.post("/ocm/flows")
+async def ocm_create_flow(data: FlowIn, user=Depends(current_user)):
+    doc = {**data.model_dump(), "id": uid(), "createdAt": now_iso()}
+    await db.ocm_flows.insert_one(doc)
+    return clean(doc)
+
+
+@api.put("/ocm/flows/{fid}")
+async def ocm_update_flow(fid: str, body: Dict[str, Any], user=Depends(current_user)):
+    await db.ocm_flows.update_one({"id": fid}, {"$set": body})
+    d = await db.ocm_flows.find_one({"id": fid}, {"_id": 0})
+    return d
+
+
+class SocialPostIn(BaseModel):
+    caption: str
+    hashtags: List[str] = []
+    channels: List[str] = ["INSTAGRAM"]
+    mediaUrl: Optional[str] = None
+    scheduledAt: Optional[str] = None
+    status: str = "SCHEDULED"
+
+
+@api.get("/ocm/social-posts")
+async def ocm_list_posts(user=Depends(current_user)):
+    items = await db.social_posts.find({}, {"_id": 0}).sort("scheduledAt", -1).to_list(500)
+    return {"items": items}
+
+
+@api.post("/ocm/social-posts")
+async def ocm_create_post(data: SocialPostIn, user=Depends(current_user)):
+    doc = {**data.model_dump(), "id": uid(), "createdBy": user["name"], "createdAt": now_iso()}
+    await db.social_posts.insert_one(doc)
+    return clean(doc)
+
+
+@api.put("/ocm/social-posts/{pid}")
+async def ocm_update_post(pid: str, body: Dict[str, Any], user=Depends(current_user)):
+    await db.social_posts.update_one({"id": pid}, {"$set": body})
+    d = await db.social_posts.find_one({"id": pid}, {"_id": 0})
+    return d
+
+
+@api.delete("/ocm/social-posts/{pid}")
+async def ocm_delete_post(pid: str, user=Depends(current_user)):
+    await db.social_posts.delete_one({"id": pid})
+    return {"ok": True}
+
+
+class AiCaptionIn(BaseModel):
+    prompt: str
+    tone: str = "friendly"
+    vertical: Optional[str] = None
+    channel: str = "INSTAGRAM"
+
+
+@api.post("/ai/caption")
+async def ai_caption(data: AiCaptionIn, user=Depends(current_user)):
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(500, "AI key not configured")
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        system = (
+            "You are a social media copywriter for GLC Zone, an India-first business running 8 verticals "
+            "(GLC Fresh, GLC Store, GLC Garden, GLC Hardwares, Dhani Jewellers, India Mandi, GLC Property, GLC Legal). "
+            f"Write a {data.tone} caption in <60 words for {data.channel}. "
+            "Return JSON only in this exact shape: "
+            '{"caption": "...", "hashtags": ["#tag1", "#tag2", ...]} '
+            "with 5-8 relevant hashtags. Do not wrap in code fences."
+        )
+        chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"ai-caption-{user['id']}", system_message=system).with_model("gemini", "gemini-3-flash-preview")
+        prompt = f"Topic: {data.prompt}\nVertical: {data.vertical or 'GLC Zone'}\nChannel: {data.channel}\nTone: {data.tone}"
+        resp = await chat.send_message(UserMessage(text=prompt))
+        text = (resp or "").strip()
+        # Attempt to parse JSON
+        import json as _json
+        import re
+        m = re.search(r"\{.*\}", text, re.S)
+        payload = _json.loads(m.group(0)) if m else {"caption": text, "hashtags": []}
+        return payload
+    except Exception as e:
+        logging.getLogger("glc").exception(f"AI caption failed: {e}")
+        return {"caption": data.prompt, "hashtags": ["#glczone"], "error": str(e)}
+
+
+@api.get("/ocm/stats")
+async def ocm_stats(user=Depends(current_user)):
+    contacts = await db.ocm_contacts.count_documents({})
+    convs = await db.ocm_conversations.count_documents({})
+    open_convs = await db.ocm_conversations.count_documents({"status": "OPEN"})
+    broadcasts = await db.ocm_broadcasts.count_documents({})
+    scheduled_posts = await db.social_posts.count_documents({"status": "SCHEDULED"})
+    return {
+        "contacts": contacts,
+        "conversations": convs,
+        "openConversations": open_convs,
+        "broadcasts": broadcasts,
+        "scheduledPosts": scheduled_posts,
+    }
+
+
+# =========================================================
 # Seed on startup
 # =========================================================
 @app.on_event("startup")
@@ -1472,6 +1836,11 @@ async def startup_seed():
         log.info("Seed complete")
     except Exception as e:
         log.exception(f"Seed failed: {e}")
+    try:
+        init_storage()
+        log.info("Storage initialized")
+    except Exception as e:
+        log.warning(f"Storage init deferred: {e}")
 
 
 @app.on_event("shutdown")
