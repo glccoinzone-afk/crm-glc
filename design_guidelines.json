@@ -1,0 +1,146 @@
+{
+  "project": "GLC Zone Enterprise CRM + ERP",
+  "identity": {
+    "vibe": "Premium, trustworthy, scalable, modern India-first enterprise.",
+    "theme": "Light mode only (dark mode fallbacks defined but light is primary).",
+    "inspiration": "Linear (precision/borders), Stripe (shadows/typography), Notion (clean white space), Odoo/Zoho (functional density).",
+    "core_concept": "Avoid generic 'AI slop' blue/purple. Use a grounded, wealthy 'Obsidian Pine' and 'Terracotta' palette reflecting GLC's diverse verticals (Fresh, Property, Jewellery)."
+  },
+  "typography": {
+    "fonts": {
+      "primary": "Satoshi, sans-serif (or Plus Jakarta Sans)",
+      "mono": "IBM Plex Mono, monospace",
+      "import_instructions": "@import url('https://api.fontshare.com/v2/css?f[]=satoshi@900,700,500,300,400&display=swap'); @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');"
+    },
+    "hierarchy": {
+      "h1": "text-3xl md:text-4xl font-bold tracking-tight text-slate-900",
+      "h2": "text-2xl font-semibold tracking-tight text-slate-900",
+      "h3": "text-lg font-medium text-slate-800",
+      "body": "text-sm text-slate-600 leading-relaxed",
+      "data_numbers": "font-mono text-sm tracking-tight",
+      "label": "text-xs font-semibold uppercase tracking-[0.06em] text-slate-500"
+    }
+  },
+  "colors": {
+    "css_variables": {
+      "--background": "60 20% 98%",
+      "--surface": "0 0% 100%",
+      "--surface-elevated": "0 0% 100%",
+      "--border": "220 13% 91%",
+      "--border-subtle": "220 13% 95%",
+      "--text-primary": "222 47% 11%",
+      "--text-secondary": "215 16% 47%",
+      "--text-tertiary": "215 16% 65%",
+      "--brand": "158 64% 10%",
+      "--brand-light": "158 64% 94%",
+      "--accent": "27 90% 55%",
+      "--positive": "142 71% 45%",
+      "--warning": "38 92% 50%",
+      "--danger": "348 83% 47%",
+      "--ring": "158 64% 10%",
+      "--sidebar-bg": "0 0% 100%",
+      "--sidebar-border": "220 13% 91%"
+    },
+    "chart_palette": [
+      "#064E3B", 
+      "#10B981", 
+      "#F59E0B", 
+      "#EA580C", 
+      "#6366F1", 
+      "#0EA5E9"
+    ],
+    "tailwind_mapping": {
+      "bg-app": "bg-[#FAFAFA]",
+      "bg-surface": "bg-white",
+      "text-main": "text-slate-900",
+      "text-muted": "text-slate-500",
+      "brand": "bg-[#064E3B]"
+    }
+  },
+  "shadows": {
+    "tokens": {
+      "sm": "0 1px 2px 0 rgba(0, 0, 0, 0.03)",
+      "md": "0 2px 4px -1px rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.02)",
+      "lg": "0 4px 6px -1px rgba(0, 0, 0, 0.04), 0 2px 4px -2px rgba(0, 0, 0, 0.02)",
+      "xl": "0 10px 15px -3px rgba(0, 0, 0, 0.06), 0 4px 6px -4px rgba(0, 0, 0, 0.03)",
+      "float": "0 0 0 1px rgba(0,0,0,0.03), 0 8px 16px -4px rgba(0,0,0,0.04), 0 24px 32px -8px rgba(0,0,0,0.04)"
+    }
+  },
+  "components": {
+    "sidebar": {
+      "spec": "Floating sidebar. Width: 260px. Left margin: 16px. Top/Bottom margin: 16px. Radius: 16px (rounded-2xl). Background: white. Border: 1px solid rgba(0,0,0,0.05). Shadow: 'float'. Active item: bg-slate-50 text-slate-900 font-medium."
+    },
+    "topbar": {
+      "spec": "Sticky top navigation. Height: 64px. Background: bg-white/70. Blur: backdrop-blur-xl. Border-bottom: 1px solid var(--border). Padding-left: 292px (to accommodate floating sidebar). Features: Global Search Command Palette (Cmd+K) button, Vertical Switcher Dropdown, Profile."
+    },
+    "card": {
+      "spec": "Radius: 16px to 20px (rounded-2xl or rounded-[20px]). Background: pure white. Border: 1px solid var(--border). Shadow: sm or md. Padding: p-5 or p-6."
+    },
+    "data_grid": {
+      "spec": "Row height: 44px (dense but breathable). Header: sticky top-0, bg-slate-50/80 backdrop-blur-sm, text-xs uppercase text-slate-500. Row hover: bg-slate-50. No zebra stripes (looks dated), use subtle bottom borders (border-b border-slate-100) instead. Cells containing amounts/numbers MUST use font-mono."
+    },
+    "kanban": {
+      "spec": "Column background: bg-slate-50/50 rounded-xl. Card: bg-white rounded-lg border border-slate-200 shadow-sm hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 cursor-grab."
+    },
+    "timeline": {
+      "spec": "Vertical line: w-px bg-slate-200. Marker: 8px dot ringed by 4px white background. Content card: subtle border, rounded-lg. Used in CRM lead history and Audit Logs."
+    },
+    "badges": {
+      "spec": "Pill shaped (rounded-full). Height: 24px. Padding: px-2.5 py-0.5. Font: text-xs font-medium. Soft backgrounds (e.g., bg-emerald-50 text-emerald-700, bg-amber-50 text-amber-700)."
+    },
+    "buttons": {
+      "spec": "Slightly rounded (rounded-lg or rounded-xl). Primary: bg-[#064E3B] hover:bg-[#064E3B]/90 text-white. Secondary: bg-white border border-slate-200 text-slate-700 hover:bg-slate-50. Transition: transform 0.1s ease, active:scale-[0.98]."
+    },
+    "skeleton_loaders": {
+      "spec": "Subtle pulsing bg-slate-100 rounded-md. Avoid high-contrast blinking."
+    }
+  },
+  "layouts": {
+    "dashboard": "Top: 4 KPI Cards (white, subtle shadow, mono numbers). Middle: 2 Col Grid (Col-span-8: Revenue Area Chart, Col-span-4: Sales by Vertical Donut). Bottom: Recent Activity table.",
+    "crm_pipeline": "Horizontal scrollable flex container. 4-5 columns (Lead, Contacted, Qualified, Proposal, Won). Draggable cards.",
+    "customer_360": "2-Column Split. Left (Col 4): Profile Card + Contact Info + Tags. Right (Col 8): Tabs (Timeline, Transactions, Support Tickets, Documents).",
+    "invoice_generator": "White paper-like card (max-w-4xl mx-auto, shadow-lg, p-12). Top: GLC Logo + Company details. Grid for line items. Bottom: Total calculations and Tax breakup (CGST/SGST)."
+  },
+  "visual_enhancers": {
+    "glassmorphism": "Use sparingly ONLY on the sticky topbar, sticky table headers, and overlay dialogs/modals (backdrop-blur-md bg-white/60). Never on standard cards.",
+    "icons": "Lucide React. Use a consistent stroke width (1.5px) and size (18px for nav, 16px for buttons).",
+    "charts": "Recharts. Use responsive containers. Tooltips must be glassmorphic with sharp borders. Use smooth curves for line/area charts (type='monotone')."
+  },
+  "image_urls": {
+    "hero_empty_states": [
+      {
+        "url": "https://images.unsplash.com/photo-1686061594225-3e92c0cd51b0?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODF8MHwxfHNlYXJjaHwzfHxlbnRlcnByaXNlJTIwZGFzaGJvYXJkJTIwbW9kZXJuJTIwdWl8ZW58MHx8fHwxNzg0NjIwMTI3fDA&ixlib=rb-4.1.0&q=85",
+        "category": "dashboard_placeholder",
+        "description": "Abstract data illustration for empty dashboard or setup states"
+      }
+    ],
+    "avatars": [
+      {
+        "url": "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?ixlib=rb-1.2.1&auto=format&fit=facearea&facepad=2&w=256&h=256&q=80",
+        "category": "user_avatar",
+        "description": "Premium professional headshot for topbar profile"
+      }
+    ]
+  },
+  "instructions_to_main_agent": [
+    "STRICTLY read and apply the css variables and tailwind classes mapped in this document.",
+    "DO NOT use generic blue or purple primary colors. The brand color is 'Deep Pine/Obsidian Green' (#064E3B).",
+    "Ensure all numerical data (currency, percentages, IDs) uses 'font-mono' for alignment.",
+    "Implement the floating sidebar as specified (w-64, m-4, rounded-2xl). The main content area must account for this offset.",
+    "For the multi-vertical switcher, use a Shadcn DropdownMenu in the Topbar with a distinctive visual style.",
+    "Do not add heavy borders or heavy shadows. Keep it light, airy, and high-contrast.",
+    "Use Recharts for all graphs. Apply the custom 'chart_palette' provided in this JSON.",
+    "Every page must have an empty state if no data is present, featuring a Lucide icon and a subtle CTA.",
+    "Use framer-motion for subtle entrance animations (e.g., initial={opacity:0, y:10} animate={opacity:1, y:0}) on cards and page loads.",
+    "Ensure all interactive elements have data-testid attributes for testing.",
+    "Ensure UI is accessible (APCA/WCAG contrast ratios) and supports keyboard navigation."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": {
+    "spacing": "Use 2-3x more spacing than default. E.g., Use gap-6 or gap-8 instead of gap-4 for grids.",
+    "transitions": "DO NOT use 'transition: all'. Explicitly define properties like 'transition-colors' or 'transition-transform'.",
+    "alignment": "Left-align text by default. Never apply text-align: center globally.",
+    "components": "Prioritize Shadcn UI. Override default Shadcn border radius to match the 16-20px spec where appropriate.",
+    "toast": "Use 'sonner' for toasts. Position them at bottom-right.",
+    "testing": "All key elements MUST have data-testid attribute in kebab-case."
+  }
+}
