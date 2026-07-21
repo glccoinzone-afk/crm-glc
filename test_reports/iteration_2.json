@@ -1,0 +1,58 @@
+{
+  "summary": "Frontend E2E testing of GLC Zone CRM+ERP. Login, dashboard, and all 13 modules verified. Fixed 2 CRITICAL React crashes on /crm/pipeline and /delivery (useEffect(load,[]) returning Promise caused 'destroy is not a function' pageerror, rendering blank page). After fix all pages load with sidebar. All core flows working: login, KPIs (10), 3 charts, vertical switcher, leads create, orders filter (20->2 for DELIVERED), invoice payment, run payroll (populates payroll-grid), tasks kanban with cards, notif bell, logout. Zero console errors after fix.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Pipeline.jsx", "issue": "FIXED by test agent: useEffect(load, []) where load returns Promise crashed page - React interpreted Promise as cleanup fn ('destroy is not a function'). Entire /crm/pipeline route rendered blank.", "selector": "/crm/pipeline", "priority": "CRITICAL-FIXED"},
+      {"component": "Deliveries.jsx", "issue": "FIXED by test agent: same useEffect(load, []) Promise bug - /delivery rendered blank with no sidebar.", "selector": "/delivery", "priority": "CRITICAL-FIXED"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_id_mismatches_vs_spec": [
+    "Sidebar labels auto-generate testids from label text (kebab-case). Spec mismatches: nav-pipeline (actual nav-sales-pipeline), nav-tickets (nav-support-tickets), nav-audit (nav-audit-log), nav-accounts (nav-chart-of-accounts), nav-gst (nav-gst-reports)",
+    "Quotations page uses testid 'quotes-grid' not 'quotations-grid'",
+    "Deliveries page uses 'deliveries-board' not 'deliveries-grid'",
+    "Finance/Accounts uses 'coa-grid' not 'accounts-grid'",
+    "Purchase Orders page has NO grid-level testid ('po-grid' missing) - only row-level receive buttons",
+    "HR/Attendance has 'attendance-page' but NO 'attendance-grid' testid on the matrix",
+    "Tasks page has 'tasks-page' + task-<id> cards but NO 'tasks-kanban' wrapper testid",
+    "Documents and Settings pages missing dedicated grid/root testids beyond page-level"
+  ],
+  "verified_flows": [
+    "Login via quick-login-super-admin + login-submit -> success toast, redirected to /",
+    "Dashboard: app-sidebar, app-topbar, kpi-grid (10 cards), chart-revenue, chart-sales-vertical, chart-funnel, vertical-switcher opens dropdown, glc-store option updates context",
+    "nav-leads -> /crm/leads, 13 rows, new-lead-btn opens dialog, save-lead creates lead successfully",
+    "nav-customers -> /crm/customers loads with customers-grid",
+    "/crm/pipeline (after fix): pipeline-board with 6 stage columns",
+    "/crm/quotations: new-quote-btn opens dialog (new-quote-dialog); quotes-grid populated",
+    "/sales/orders: orders-grid with 20 rows; orders-status-filter=DELIVERED filters to 2 rows",
+    "/sales/invoices: 10 invoice-pay buttons, save-payment closes dialog",
+    "/inventory/products, /inventory/stock, /purchase/suppliers load with expected data",
+    "/hr/employees, /hr/leaves load; /hr/payroll run-payroll button generates payroll-grid",
+    "/finance/accounts (coa-grid), /finance/journal (journal-grid), /finance/gst (gst-grid), /finance/expenses (expenses-grid) load",
+    "/projects (projects-grid), /tasks (12+ task cards), /tickets (tickets-grid), /audit (audit-grid), /settings, /documents load with sidebar and 0 console errors",
+    "notif-bell opens popover with 'Mark all read'",
+    "profile-menu -> logout-btn redirects to /login"
+  ],
+  "test_report_links": [],
+  "action_items": [
+    "Align data-testids to spec OR update spec: add tasks-kanban wrapper testid, po-grid on Purchase Orders, attendance-grid on Attendance matrix, alias quotes-grid->quotations-grid, coa-grid->accounts-grid, deliveries-board->deliveries-grid",
+    "Consider aliasing sidebar nav testids for compound labels (nav-pipeline, nav-tickets, nav-audit, nav-accounts, nav-gst) to match spec convention",
+    "Review other useEffect(load,[]) patterns for future - fixed 2 but confirm expression-body load functions are wrapped in arrow function"
+  ],
+  "critical_code_review_comments": [
+    "useEffect(load, []) anti-pattern: when load = () => api.get().then(...), it returns a Promise; React uses return value as cleanup. Caused runtime crash. Prefer useEffect(() => { load(); }, []).",
+    "Many list wrappers lack a stable data-testid at the container level (see tasks-kanban, po-grid, attendance-grid) which limits E2E testability."
+  ],
+  "updated_files": [
+    "/app/frontend/src/pages/crm/Pipeline.jsx",
+    "/app/frontend/src/pages/delivery/Deliveries.jsx"
+  ],
+  "success_rate": {"backend": "n/a (not tested this iteration)", "frontend": "95% (2 critical bugs fixed; remaining are testid naming mismatches, not functional bugs)"},
+  "test_credentials": "bishwajeet@glczone.in / Admin@123 (quick-login-super-admin works)",
+  "seed_data_creation": "Created 'QA Prospect Ltd' lead via UI",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend passed 38/38 previously. Frontend now functional across all 13 modules after fixing 2 Promise-returning useEffect crashes on Pipeline and Deliveries. Testid naming diverges from spec in several places but functionality is intact."
+}

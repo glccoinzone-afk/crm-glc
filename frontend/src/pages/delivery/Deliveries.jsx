@@ -14,7 +14,7 @@ const LANES = [
 export default function Deliveries() {
   const [rows, setRows] = useState([]);
   const load = () => api.get("/deliveries").then((r) => setRows(r.data.items || []));
-  useEffect(load, []);
+  useEffect(() => { load(); }, []);
 
   const move = async (d, status) => {
     await api.put(`/deliveries/${d.id}`, { status });

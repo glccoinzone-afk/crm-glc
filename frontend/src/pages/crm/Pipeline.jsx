@@ -23,7 +23,7 @@ export default function Pipeline() {
   const [dragged, setDragged] = useState(null);
 
   const load = () => api.get("/deals").then((r) => setDeals(r.data.items || []));
-  useEffect(load, []);
+  useEffect(() => { load(); }, []);
 
   const byStage = (k) => deals.filter((d) => d.stage === k);
   const totalStage = (k) => byStage(k).reduce((s, d) => s + (d.value || 0), 0);
