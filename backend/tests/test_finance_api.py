@@ -155,3 +155,10 @@ def test_invoice_pdf_renders(api):
     inv = api.get("/api/invoices?limit=1", headers=api.admin).json()["items"][0]
     r = api.get(f"/api/invoices/{inv['id']}/pdf", headers=api.admin)
     assert r.status_code == 200 and r.content[:4] == b"%PDF"
+
+
+def test_invoice_found_by_website_order_number(api):
+    """The website calls /orders/GLZ-<id>/invoice; webhook orders were stored as '#<id>' and used to 404."""
+    _order(api, 90, orderNo="#90", paymentMethod="RAZORPAY", paymentStatus="PENDING", glczone_status="received")
+    r = api.post("/api/orders/GLZ-90/invoice", headers=api.admin)
+    assert r.status_code == 200 and r.json()["orderId"] == "so-90"
