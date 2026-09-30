@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { useParams, Link } from "react-router-dom";
 import { ArrowLeft, Mail, Phone, MapPin, Building2, Receipt, ShoppingCart, LifeBuoy, IndianRupee } from "lucide-react";
 import api, { fmtInr, fmtDate } from "@/lib/glc";
@@ -54,6 +55,7 @@ export default function Customer360() {
             <TabsTrigger value="invoices">Invoices</TabsTrigger>
             <TabsTrigger value="payments">Payments</TabsTrigger>
             <TabsTrigger value="tickets">Support</TabsTrigger>
+            <TabsTrigger value="documents">Documents</TabsTrigger>
           </TabsList>
           <TabsContent value="orders" className="mt-4">
             <SimpleTable
@@ -75,6 +77,9 @@ export default function Customer360() {
               cols={[["Ticket", "ticketNo", true], ["Subject", "subject"], ["Priority", "priority", false, (v) => <StatusBadge value={v} />], ["Status", "status", false, (v) => <StatusBadge value={v} />]]}
               rows={data.tickets || []}
             />
+          </TabsContent>
+          <TabsContent value="documents" className="mt-4">
+            <CustomerDocs customerId={data.customer?.id} />
           </TabsContent>
         </Tabs>
       </div>
@@ -104,6 +109,64 @@ function SimpleTable({ cols, rows }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+
+function CustomerDocs({ customerId }) {
+  const [docs, setDocs] = useState([]);
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef(null);
+  const load = () => {
+    if (!customerId) return;
+    api.get("/documents", { params: { q: customerId } }).then((r) => setDocs(r.data.items || []));
+  };
+  useEffect(load, [customerId]);
+
+  const upload = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setUploading(true);
+    try {
+      for (const f of files) {
+        const fd = new FormData();
+        fd.append("file", f);
+        await api.post(`/documents/upload?category=CUSTOMER-${customerId}`, fd, { headers: { "Content-Type": "multipart/form-data" } });
+      }
+      toast.success(`${files.length} file(s) uploaded`);
+      load();
+    } catch { toast.error("Upload failed"); }
+    finally { setUploading(false); if (fileRef.current) fileRef.current.value = ""; }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[13px] font-medium text-slate-600">Customer Documents</span>
+        <div>
+          <input ref={fileRef} type="file" onChange={upload} className="hidden" id="c360-upload" multiple />
+          <label htmlFor="c360-upload" className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium cursor-pointer ${uploading ? "bg-slate-200 text-slate-500" : "bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"}`}>
+            {uploading ? "Uploading…" : "📎 Upload File"}
+          </label>
+        </div>
+      </div>
+      {docs.length === 0 ? (
+        <div className="text-center py-8 text-slate-400 text-[13px]">No documents yet — upload contracts, KYC, or any files</div>
+      ) : (
+        <div className="space-y-2">
+          {docs.map((d) => (
+            <div key={d.id} className="flex items-center gap-3 p-3 rounded-lg border border-slate-100 hover:bg-slate-50">
+              <span className="text-lg">📄</span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-medium truncate">{d.name}</div>
+                <div className="text-[11px] text-slate-400">{d.uploadedBy} · {new Date(d.createdAt).toLocaleDateString()}</div>
+              </div>
+              <a href={`/crm/api/documents/${d.id}/download?auth=${localStorage.getItem("glc_token")}`} target="_blank" rel="noreferrer" className="text-[11px] px-2 py-1 rounded-md border border-slate-200 text-slate-500 hover:bg-slate-100">Download</a>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

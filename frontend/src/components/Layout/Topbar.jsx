@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Bell, Search, ChevronDown, LogOut, User, Building2, Check } from "lucide-react";
+import { Bell, Search, ChevronDown, LogOut, User, Building2, Check, Menu, FileText, Users, Package, UserCheck, Briefcase } from "lucide-react";
+import { useRef, useCallback } from "react";
 import api, { VERTICALS } from "@/lib/glc";
 import { useAuth, useVertical } from "@/context/AuthContext";
+import { useMobileNav } from "@/context/MobileNavContext";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -10,10 +12,30 @@ import { fmtDate } from "@/lib/glc";
 
 export default function Topbar() {
   const { user, logout } = useAuth();
+  const { openMobile } = useMobileNav();
   const { vertical, setVertical } = useVertical();
   const nav = useNavigate();
   const [notifs, setNotifs] = useState({ items: [], unread: 0 });
   const [search, setSearch] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchRef = useRef(null);
+  const searchTimer = useRef(null);
+
+  const TYPE_ICONS = { Lead: Briefcase, Customer: Users, Invoice: FileText, Product: Package, Employee: UserCheck };
+  const TYPE_COLORS = { Lead: "text-blue-500", Customer: "text-green-500", Invoice: "text-purple-500", Product: "text-orange-500", Employee: "text-slate-500" };
+
+  const doSearch = (val) => {
+    clearTimeout(searchTimer.current);
+    if (!val || val.length < 2) { setSearchResults([]); setSearchOpen(false); return; }
+    searchTimer.current = setTimeout(async () => {
+      try {
+        const r = await api.get("/search", { params: { q: val } });
+        setSearchResults(r.data.results || []);
+        setSearchOpen(true);
+      } catch(e) {}
+    }, 300);
+  };
 
   const loadNotifs = () => api.get("/notifications").then((r) => setNotifs(r.data)).catch(() => {});
   useEffect(() => { loadNotifs(); const t = setInterval(loadNotifs, 30000); return () => clearInterval(t); }, []);
@@ -25,9 +47,16 @@ export default function Topbar() {
   return (
     <header
       data-testid="app-topbar"
-      className="glass sticky top-0 z-20 h-16 border-b border-slate-200/70 flex items-center px-8"
-      style={{ paddingLeft: "300px" }}
+      className="glass sticky top-0 z-20 h-16 border-b border-slate-200/70 flex items-center px-4 lg:px-8 lg:pl-[300px]"
     >
+      <button
+        data-testid="mobile-menu-btn"
+        onClick={openMobile}
+        className="lg:hidden mr-2 w-9 h-9 rounded-lg border border-slate-200 bg-white grid place-items-center shrink-0"
+      >
+        <Menu size={18} className="text-slate-700" />
+      </button>
+
       {/* Vertical switcher */}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -61,18 +90,38 @@ export default function Topbar() {
       </DropdownMenu>
 
       {/* Search */}
-      <div className="mx-4 flex-1 max-w-md">
+      <div className="mx-4 flex-1 max-w-md relative" ref={searchRef}>
         <div className="relative">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             data-testid="global-search"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => { setSearch(e.target.value); doSearch(e.target.value); }}
+            onFocus={() => search.length >= 2 && setSearchOpen(true)}
+            onBlur={() => setTimeout(() => setSearchOpen(false), 200)}
             placeholder="Search leads, customers, invoices…"
             className="w-full h-9 pl-9 pr-16 rounded-lg bg-slate-50 border border-transparent focus:border-slate-200 focus:bg-white text-[13px] outline-none transition-colors"
           />
           <kbd className="hidden md:block absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-slate-400 border border-slate-200 rounded px-1.5 py-0.5 bg-white">⌘K</kbd>
         </div>
+        {searchOpen && searchResults.length > 0 && (
+          <div className="absolute top-11 left-0 right-0 bg-white rounded-xl border border-slate-200 shadow-xl z-50 overflow-hidden">
+            {searchResults.map((r, i) => {
+              const Icon = TYPE_ICONS[r.type] || Search;
+              return (
+                <div key={i} onClick={() => { nav(r.url); setSearch(""); setSearchOpen(false); }}
+                  className="flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 cursor-pointer border-b border-slate-50 last:border-0">
+                  <Icon size={14} className={TYPE_COLORS[r.type] || "text-slate-400"} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-medium text-slate-800 truncate">{r.title}</div>
+                    <div className="text-[11px] text-slate-400 truncate">{r.type} {r.subtitle ? "· " + r.subtitle : ""}</div>
+                  </div>
+                  {r.status && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">{r.status}</span>}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div className="ml-auto flex items-center gap-2">

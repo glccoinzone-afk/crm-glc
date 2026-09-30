@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Truck } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import api, { fmtDate } from "@/lib/glc";
 import { PageHeader, EmptyState, StatusBadge } from "@/components/common/GlcUI";
 import { toast } from "sonner";
@@ -13,8 +14,26 @@ const LANES = [
 
 export default function Deliveries() {
   const [rows, setRows] = useState([]);
+  const [syncing, setSyncing] = useState(false);
+  const [canSync, setCanSync] = useState(false);
+  useEffect(() => {
+    api.get("/rbac/me").then((r) => {
+      const perms = r.data.modules || [];
+      setCanSync(perms.includes("*") || perms.some((p) => ["delivery"].includes(p)));
+    });
+  }, []);
   const load = () => api.get("/deliveries").then((r) => setRows(r.data.items || []));
   useEffect(() => { load(); }, []);
+
+  const syncNow = async () => {
+    setSyncing(true);
+    try {
+      const r = await api.post("/sync/deliveries");
+      toast.success(`Synced: ${r.data.created} new, ${r.data.updated} updated`);
+      load();
+    } catch { toast.error("Sync failed"); }
+    finally { setSyncing(false); }
+  };
 
   const move = async (d, status) => {
     await api.put(`/deliveries/${d.id}`, { status });
@@ -26,7 +45,10 @@ export default function Deliveries() {
 
   return (
     <div className="space-y-6">
-      <PageHeader testId="deliveries-page" title="Deliveries" subtitle="Assign, track, and verify OTP-based deliveries in real time" />
+      <div className="flex items-center justify-between">
+        <PageHeader testId="deliveries-page" title="Deliveries" subtitle="Assign, track, and verify OTP-based deliveries in real time" />
+        {canSync && <button onClick={syncNow} disabled={syncing} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 text-[12.5px] font-medium hover:bg-slate-50 disabled:opacity-50"><RefreshCw size={13} className={syncing?"animate-spin":""} />{syncing?"Syncing…":"Sync glczone.in"}</button>}
+      </div>
       {rows.length === 0 ? (
         <EmptyState icon={Truck} title="No deliveries yet" description="Deliveries appear automatically for shipped orders." />
       ) : (

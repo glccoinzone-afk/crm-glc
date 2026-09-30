@@ -9,14 +9,22 @@ export function AuthProvider({ children }) {
   });
   const [loading, setLoading] = useState(true);
 
+  const fetchModules = async (userObj) => {
+    try {
+      const r = await api.get("/rbac/me");
+      const merged = { ...userObj, modules: r.data.modules };
+      localStorage.setItem("glc_user", JSON.stringify(merged));
+      setUser(merged);
+    } catch {
+      setUser(userObj);
+    }
+  };
+
   useEffect(() => {
     const t = localStorage.getItem("glc_token");
     if (t) {
       api.get("/auth/me")
-        .then((r) => {
-          setUser(r.data);
-          localStorage.setItem("glc_user", JSON.stringify(r.data));
-        })
+        .then((r) => fetchModules(r.data))
         .catch(() => {
           localStorage.removeItem("glc_token");
           localStorage.removeItem("glc_user");
@@ -28,11 +36,11 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
-  const login = async (email, password) => {
-    const r = await api.post("/auth/login", { email, password });
+  const login = async (employeeCode, pin) => {
+    const r = await api.post("/auth/employee-login", { employee_code: employeeCode, pin });
+    if (r.data.requires_2fa) return r.data;
     localStorage.setItem("glc_token", r.data.token);
-    localStorage.setItem("glc_user", JSON.stringify(r.data.user));
-    setUser(r.data.user);
+    await fetchModules(r.data.user);
     return r.data.user;
   };
 
@@ -40,7 +48,7 @@ export function AuthProvider({ children }) {
     localStorage.removeItem("glc_token");
     localStorage.removeItem("glc_user");
     setUser(null);
-    window.location.href = "/login";
+    window.location.href = "/crm";
   };
 
   return <AuthCtx.Provider value={{ user, loading, login, logout }}>{children}</AuthCtx.Provider>;

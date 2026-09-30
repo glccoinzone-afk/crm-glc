@@ -5,10 +5,12 @@ import {
   LayoutDashboard, Users, UserSquare2, Kanban, FileText, ShoppingCart, Receipt,
   Package, Warehouse, Truck, Building2, ClipboardList, UserRound, CalendarClock,
   Wallet, BarChart3, FolderKanban, LifeBuoy, FileArchive, Settings2, ScrollText,
-  Sparkles, MessageSquare, Megaphone, Bot, Send, CalendarDays
+  Sparkles, MessageSquare, Megaphone, Bot, Send, CalendarDays, TrendingUp, Store
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { canAccess } from "@/lib/rbac";
+import { useMobileNav } from "@/context/MobileNavContext";
+import { X } from "lucide-react";
 
 const groups = [
   {
@@ -52,6 +54,7 @@ const groups = [
       { to: "/ocm/flows", label: "Chatbot Flows", icon: Bot, mod: "ocm.flows" },
       { to: "/ocm/social", label: "Social Scheduler", icon: Send, mod: "ocm.social" },
       { to: "/ocm/calendar", label: "Content Calendar", icon: CalendarDays, mod: "ocm.calendar" },
+      { to: "/sellers", label: "Seller Management", icon: Store, mod: "*" },
     ],
   },
   {
@@ -69,6 +72,7 @@ const groups = [
       { to: "/finance/accounts", label: "Chart of Accounts", icon: BarChart3, mod: "finance.accounts" },
       { to: "/finance/journal", label: "Journal", icon: ScrollText, mod: "finance.journal" },
       { to: "/finance/gst", label: "GST Reports", icon: FileText, mod: "finance.gst" },
+      { to: "/finance/pl", label: "Profit & Loss", icon: TrendingUp, mod: "finance.pl" },
       { to: "/finance/expenses", label: "Expenses", icon: Wallet, mod: "finance.expenses" },
     ],
   },
@@ -93,26 +97,42 @@ const groups = [
 export default function Sidebar() {
   const { pathname } = useLocation();
   const { user } = useAuth();
+  const { mobileOpen, closeMobile } = useMobileNav();
   const role = user?.role || "Admin";
 
   const visible = groups.map((g) => ({
     ...g,
-    items: g.items.filter((it) => canAccess(role, it.mod)),
+    items: g.items.filter((it) => canAccess(role, it.mod, user?.modules)),
   })).filter((g) => g.items.length > 0);
 
   return (
-    <aside
-      data-testid="app-sidebar"
-      className="hidden lg:flex flex-col fixed left-4 top-4 bottom-4 w-[260px] bg-white rounded-2xl card-elev overflow-hidden z-30"
-    >
+    <>
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 z-40 lg:hidden"
+          onClick={closeMobile}
+          data-testid="sidebar-backdrop"
+        />
+      )}
+      <aside
+        data-testid="app-sidebar"
+        className={
+          "flex flex-col fixed top-4 bottom-4 w-[260px] bg-white rounded-2xl card-elev overflow-hidden z-50 transition-transform duration-200 " +
+          (mobileOpen ? "translate-x-0 left-4" : "-translate-x-[120%] left-4") +
+          " lg:translate-x-0 lg:left-4"
+        }
+      >
       <div className="px-5 pt-5 pb-4 flex items-center gap-2">
         <div className="w-9 h-9 rounded-xl bg-[hsl(var(--primary))] text-white grid place-items-center">
           <Sparkles size={18} strokeWidth={2} />
         </div>
-        <div>
+        <div className="flex-1">
           <div className="text-[15px] font-semibold tracking-tight text-slate-900 leading-4">GLC Zone</div>
           <div className="text-[11px] text-slate-500 mt-0.5">Enterprise CRM + ERP</div>
         </div>
+        <button onClick={closeMobile} className="lg:hidden p-1.5 rounded-lg hover:bg-slate-100" data-testid="sidebar-close">
+          <X size={18} className="text-slate-500" />
+        </button>
       </div>
 
       <nav className="flex-1 overflow-y-auto px-3 pb-4">
@@ -129,6 +149,7 @@ export default function Sidebar() {
                   <li key={it.to}>
                     <NavLink
                       to={it.to}
+                      onClick={closeMobile}
                       data-testid={`nav-${it.label.toLowerCase().replace(/\s+/g, "-")}`}
                       data-active={active}
                       className="side-item flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13.5px] text-slate-700 hover:bg-slate-50"
@@ -150,6 +171,7 @@ export default function Sidebar() {
       <div className="px-4 py-3 border-t border-slate-100 text-[11px] text-slate-400">
         v1.1 · India-first ERP + OCM
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }

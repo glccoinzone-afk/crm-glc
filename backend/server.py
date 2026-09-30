@@ -1,5 +1,5 @@
 """GLC Zone CRM + ERP - Backend (FastAPI + MongoDB)."""
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta, date
 import os
+import json
 import uuid
+import asyncio
 import logging
 import bcrypt
 import jwt as pyjwt
@@ -163,6 +165,9 @@ async def auth_login(data: LoginIn):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not u.get("isActive", True):
         raise HTTPException(status_code=403, detail="Account disabled")
+    if u.get("twofa_enabled") and u.get("totp_secret"):
+        temp_token = make_token(u["id"], u["email"], u.get("role", "Admin"))
+        return {"requires_2fa": True, "temp_token": temp_token}
     token = make_token(u["id"], u["email"], u.get("role", "Admin"))
     await log_activity(u["id"], "auth", "login")
     return {"token": token, "user": clean(u)}
@@ -171,6 +176,140 @@ async def auth_login(data: LoginIn):
 @api.get("/auth/me")
 async def auth_me(user=Depends(current_user)):
     return user
+
+
+class EmployeeLoginIn(BaseModel):
+    employee_code: str
+    pin: str
+
+
+@api.post("/auth/employee-login")
+async def auth_employee_login(data: EmployeeLoginIn):
+    try:
+        resp = requests.post(
+            "https://glczone.in/api/crm/verify-employee",
+            json={"employee_code": data.employee_code, "pin": data.pin},
+            timeout=10,
+        )
+    except Exception:
+        raise HTTPException(503, "Could not reach verification service. Try again.")
+
+    if resp.status_code == 429:
+        raise HTTPException(429, "Too many attempts. Please wait a minute and try again.")
+
+    body = resp.json() if resp.content else {}
+    if resp.status_code != 200 or not body.get("valid"):
+        raise HTTPException(401, body.get("message", "Invalid Employee ID or PIN"))
+
+    role = body["role"]
+    name = body.get("name", "Employee")
+    employee_code = data.employee_code
+
+    u = await db.users.find_one({"$or": [{"employee_code": employee_code}, {"employeeCode": employee_code}]})
+    if u:
+        if not u.get("isActive", True):
+            raise HTTPException(403, "This account is disabled")
+        await db.users.update_one({"employee_code": employee_code}, {"$set": {"role": role, "name": name}})
+        u["role"] = role
+        u["name"] = name
+    else:
+        u = {
+            "id": uid(),
+            "employee_code": employee_code,
+            "name": name,
+            "email": f"{employee_code.lower()}@glczone.internal",
+            "password": hash_pw(uid()),
+            "role": role,
+            "avatar": f"https://api.dicebear.com/7.x/initials/svg?seed={name.replace(' ', '')[:2]}",
+            "department": "Operations",
+            "isActive": True,
+            "createdAt": now_iso(),
+        }
+        await db.users.insert_one(dict(u))
+
+    if u.get("twofa_enabled") and u.get("totp_secret"):
+        temp_token = make_token(u["id"], u["email"], role)
+        return {"requires_2fa": True, "temp_token": temp_token}
+    token = make_token(u["id"], u["email"], role)
+    await log_activity(u["id"], "auth", "employee_login")
+    return {"token": token, "user": clean(u)}
+
+
+import hmac
+import httpx
+import hashlib
+
+CRM_SSO_SECRET = os.environ.get("CRM_SSO_SECRET", "")
+
+
+@api.get("/auth/sso")
+async def auth_sso(role: str, employee_code: str, name: str, exp: str, sig: str):
+    if not CRM_SSO_SECRET:
+        raise HTTPException(500, "SSO not configured")
+    payload_str = f"{role}|{employee_code}|{name}|{exp}"
+    expected_sig = hmac.new(CRM_SSO_SECRET.encode(), payload_str.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, sig):
+        raise HTTPException(401, "Invalid SSO signature")
+    if int(exp) < int(datetime.now(timezone.utc).timestamp()):
+        raise HTTPException(401, "SSO link expired")
+    valid_sso_roles = (
+        "Super Admin", "Admin", "Manager", "Catalog Manager", "Logistics Manager",
+        "Warehouse Manager", "Seller Relations Manager", "Telecaller",
+        "Finance Staff", "Marketing Manager", "System Admin",
+    )
+    if role not in valid_sso_roles:
+        raise HTTPException(403, "Role not permitted")
+
+    u = await db.users.find_one({"$or": [{"employee_code": employee_code}, {"employeeCode": employee_code}]})
+    if u:
+        if not u.get("isActive", True):
+            raise HTTPException(403, "This account is disabled")
+        await db.users.update_one({"employee_code": employee_code}, {"$set": {"role": role, "name": name}})
+        u["role"] = role
+        u["name"] = name
+    else:
+        u = {
+            "id": uid(),
+            "employee_code": employee_code,
+            "name": name,
+            "email": f"{employee_code.lower()}@glczone.internal",
+            "password": hash_pw(uid()),
+            "role": role,
+            "avatar": f"https://api.dicebear.com/7.x/initials/svg?seed={name.replace(' ', '')[:2]}",
+            "department": "Operations",
+            "isActive": True,
+            "createdAt": now_iso(),
+        }
+        await db.users.insert_one(dict(u))
+
+    token = make_token(u["id"], u["email"], role)
+    await log_activity(u["id"], "auth", "sso_login")
+
+    from fastapi.responses import HTMLResponse
+    html = f"""<!DOCTYPE html><html><body>
+<script>
+localStorage.setItem('glc_token', '{token}');
+localStorage.removeItem('glc_user');
+window.location.href = '/crm/';
+</script>
+Redirecting...
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
+class UserNameUpdateIn(BaseModel):
+    name: str
+
+
+@api.put("/users/{user_id}/name")
+async def update_user_name(user_id: str, data: UserNameUpdateIn, user=Depends(current_user)):
+    if user.get("role") != "Super Admin":
+        raise HTTPException(403, "Only Super Admin can rename a role seat")
+    result = await db.users.update_one({"id": user_id}, {"$set": {"name": data.name}})
+    if result.matched_count == 0:
+        raise HTTPException(404, "User not found")
+    await log_activity(user["id"], "users", "rename", user_id, {"newName": data.name})
+    return {"ok": True, "name": data.name}
 
 
 # ---------- Generic helpers for CRUD collections ----------
@@ -472,6 +611,278 @@ async def delete_quote(qid: str, user=Depends(current_user)):
     return {"ok": True}
 
 
+@api.get("/quotations/{qid}/pdf")
+async def quote_pdf(qid: str, cred: HTTPAuthorizationCredentials = Depends(bearer)):
+    # Accept token from query param (for browser direct open) or header
+    raw_token = cred.credentials if cred else None
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        payload = pyjwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    q = await db.quotations.find_one({"id": qid}, {"_id": 0})
+    if not q:
+        raise HTTPException(404, "Not found")
+    from fastapi.responses import HTMLResponse
+    items_html = ""
+    for idx, it in enumerate(q.get("items", []), 1):
+        disc = it.get("discount") or 0
+        gst = it.get("gstRate") or 0
+        amt = it["qty"] * it["rate"] * (1 - disc / 100)
+        gst_class = "gst-zero" if gst == 0 else "gst-val"
+        items_html += f"""<tr>
+            <td style="color:#64748b;font-size:11px">{idx}</td>
+            <td><span style="font-weight:600">{it.get("name","")}</span></td>
+            <td><span class="hsn-badge">{it.get("hsn","") or "—"}</span></td>
+            <td class="td-right">{it["qty"]}</td>
+            <td class="td-right" style="color:#64748b;font-size:11px">{it.get("unit","PCS")}</td>
+            <td class="td-right">₹{it["rate"]:,.2f}</td>
+            <td class="td-right" style="color:#64748b">{disc}%</td>
+            <td class="td-right"><span class="{gst_class}">{gst}%</span></td>
+            <td class="td-right">₹{amt:,.2f}</td>
+        </tr>"""
+    valid_till = ""
+    try:
+        from datetime import datetime, timedelta
+        created = q.get("createdAt","")[:10]
+        vdays = int(q.get("validDays") or 30)
+        dt = datetime.strptime(created, "%Y-%m-%d") + timedelta(days=vdays)
+        valid_till = dt.strftime("%d %b %Y")
+    except: pass
+
+    status_colors = {"DRAFT":"#f59e0b","CONVERTED":"#16a34a","SENT":"#3b82f6","CANCELLED":"#ef4444"}
+    status_color = status_colors.get(q.get("status","DRAFT"), "#64748b")
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{q.get("quoteNo","Quotation")} — GLC Zone</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:#1e293b;background:#f8fafc;padding:0}}
+  .page{{background:#fff;max-width:794px;margin:0 auto;padding:0;box-shadow:0 0 40px rgba(0,0,0,.08)}}
+  .topbar{{background:linear-gradient(135deg,#0f4c35 0%,#166534 100%);padding:28px 40px;color:#fff;display:flex;justify-content:space-between;align-items:flex-start}}
+  .company-name{{font-size:26px;font-weight:800;letter-spacing:-.5px;color:#fff}}
+  .company-sub{{font-size:11px;color:rgba(255,255,255,.75);margin-top:4px}}
+  .quote-badge{{text-align:right}}
+  .quote-no{{font-size:22px;font-weight:700;color:#fff;font-family:monospace}}
+  .quote-label{{font-size:10px;color:rgba(255,255,255,.6);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}}
+  .status-pill{{display:inline-block;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;margin-top:6px;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.3)}}
+  .meta-bar{{background:#f0fdf4;border-bottom:1px solid #dcfce7;padding:14px 40px;display:flex;gap:32px}}
+  .meta-item{{font-size:11px;color:#64748b}}.meta-item strong{{display:block;color:#1e293b;font-size:12px;margin-top:2px}}
+  .body{{padding:32px 40px}}
+  .bill-section{{display:flex;justify-content:space-between;margin-bottom:28px;gap:20px}}
+  .bill-box{{flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:16px}}
+  .bill-box h4{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px;font-weight:600}}
+  .bill-box .name{{font-size:15px;font-weight:700;color:#0f4c35;margin-bottom:4px}}
+  .bill-box .detail{{font-size:11.5px;color:#64748b;line-height:1.6}}
+  table{{width:100%;border-collapse:collapse;margin-bottom:20px}}
+  thead tr{{background:#0f4c35}}
+  thead th{{color:#fff;text-align:left;padding:10px 14px;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;font-weight:600}}
+  thead th:last-child{{text-align:right}}
+  tbody tr{{border-bottom:1px solid #f1f5f9}}
+  tbody tr:nth-child(even){{background:#fafafa}}
+  td{{padding:10px 14px;font-size:12.5px;vertical-align:middle}}
+  td:last-child{{text-align:right;font-weight:600}}
+  .td-right{{text-align:right}}
+  .totals-wrap{{display:flex;justify-content:flex-end;margin-bottom:24px}}
+  .totals-box{{width:280px;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden}}
+  .totals-row{{display:flex;justify-content:space-between;padding:9px 16px;font-size:12.5px;border-bottom:1px solid #f1f5f9}}
+  .totals-row:last-child{{background:#0f4c35;color:#fff;font-weight:700;font-size:14px;border:none}}
+  .totals-row.tax{{color:#64748b}}
+  .notes-section{{background:#fffbeb;border:1px solid #fef3c7;border-radius:10px;padding:14px 18px;margin-bottom:16px}}
+  .notes-section h4{{font-size:10px;color:#92400e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}}
+  .notes-section p{{font-size:12px;color:#78350f;line-height:1.5}}
+  .terms-section{{background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;padding:14px 18px;margin-bottom:24px}}
+  .terms-section h4{{font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}}
+  .terms-section p{{font-size:12px;color:#0c4a6e;line-height:1.5}}
+  .footer{{background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 40px;text-align:center;font-size:11px;color:#94a3b8}}
+  .footer strong{{color:#64748b}}
+  .hsn-badge{{background:#f1f5f9;color:#64748b;font-size:10px;padding:2px 6px;border-radius:4px;font-family:monospace}}
+  .gst-zero{{color:#16a34a;font-size:11px;font-weight:600}}
+  .gst-val{{color:#64748b;font-size:11px}}
+  @media print{{
+    body{{background:#fff}}
+    .page{{box-shadow:none;max-width:100%}}
+    @page{{margin:0;size:A4}}
+  }}
+</style></head><body>
+<div class="page">
+  <div class="topbar">
+    <div>
+      <div class="company-name">GLC Zone</div>
+      <div class="company-sub">GLC Zone Private Limited | CIN: U68100BR2025PTC077112</div>
+      <div class="company-sub" style="margin-top:2px">GSTIN: 10FZTPA0354J1ZJ | Kishanganj, Bihar — 855107</div>
+    </div>
+    <div class="quote-badge">
+      <div class="quote-label">Quotation</div>
+      <div class="quote-no">{q.get("quoteNo","")}</div>
+      <div class="status-pill">{q.get("status","DRAFT")}</div>
+    </div>
+  </div>
+
+  <div class="meta-bar">
+    <div class="meta-item">Date Issued<strong>{q.get("createdAt","")[:10]}</strong></div>
+    {"<div class='meta-item'>Valid Until<strong>" + valid_till + "</strong></div>" if valid_till else ""}
+    {"<div class='meta-item'>Delivery Address<strong>" + q.get("customerAddress","") + "</strong></div>" if q.get("customerAddress") else ""}
+  </div>
+
+  <div class="body">
+    <div class="bill-section">
+      <div class="bill-box">
+        <h4>Bill To</h4>
+        <div class="name">{q.get("customerName","")}</div>
+        {"<div class='detail'>" + q.get("companyName","") + "</div>" if q.get("companyName") else ""}
+        {"<div class='detail'>📞 " + q.get("customerPhone","") + "</div>" if q.get("customerPhone") else ""}
+        {"<div class='detail'>✉ " + q.get("customerEmail","") + "</div>" if q.get("customerEmail") else ""}
+        {"<div class='detail'>GSTIN: " + q.get("customerGst","") + "</div>" if q.get("customerGst") else ""}
+        {"<div class='detail'>" + q.get("customerState","") + "</div>" if q.get("customerState") else ""}
+      </div>
+      <div class="bill-box">
+        <h4>From</h4>
+        <div class="name">GLC Zone</div>
+        <div class="detail">GLC Zone Private Limited</div>
+        <div class="detail">Kishanganj, Bihar — 855107</div>
+        <div class="detail">GSTIN: 10FZTPA0354J1ZJ</div>
+        <div class="detail">📞 +91 89691 25123</div>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr>
+        <th>#</th><th>Item Description</th><th>HSN</th>
+        <th style="text-align:right">Qty</th><th style="text-align:right">Unit</th>
+        <th style="text-align:right">Rate</th><th style="text-align:right">Disc%</th>
+        <th style="text-align:right">GST%</th><th style="text-align:right">Amount</th>
+      </tr></thead>
+      <tbody>{items_html}</tbody>
+    </table>
+
+    <div class="totals-wrap">
+      <div class="totals-box">
+        <div class="totals-row"><span>Subtotal</span><span>₹{q.get("subtotal",0):,.2f}</span></div>
+        {"<div class='totals-row tax'><span>CGST</span><span>₹" + f"{q.get('cgst',0):,.2f}" + "</span></div><div class='totals-row tax'><span>SGST</span><span>₹" + f"{q.get('sgst',0):,.2f}" + "</span></div>" if q.get("cgst") else "<div class='totals-row tax'><span>IGST</span><span>₹" + f"{q.get('igst',0):,.2f}" + "</span></div>"}
+        <div class="totals-row"><span>Grand Total</span><span>₹{q.get("total",0):,.2f}</span></div>
+      </div>
+    </div>
+
+    {"<div class='notes-section'><h4>📝 Notes</h4><p>" + q.get("notes","") + "</p></div>" if q.get("notes") else ""}
+    {"<div class='terms-section'><h4>📋 Terms & Conditions</h4><p>" + q.get("terms","") + "</p></div>" if q.get("terms") else ""}
+  </div>
+
+  <div class="footer">
+    <strong>GLC Zone Private Limited</strong> · CIN: U68100BR2025PTC077112 · GSTIN: 10FZTPA0354J1ZJ<br>
+    This is a computer-generated quotation and does not require a physical signature.
+  </div>
+</div>
+<script>window.onload=()=>window.print()</script>
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
+@api.post("/quotations/{qid}/email")
+async def email_quote(qid: str, user=Depends(current_user)):
+    """Email quotation PDF to customer"""
+    q = await db.quotations.find_one({"id": qid}, {"_id": 0})
+    if not q:
+        raise HTTPException(404, "Not found")
+    customer_email = q.get("customerEmail", "")
+    if not customer_email:
+        raise HTTPException(400, "Customer email not set on this quotation")
+
+    # Build PDF HTML (reuse same logic)
+    items_html = ""
+    for idx, it in enumerate(q.get("items", []), 1):
+        disc = it.get("discount") or 0
+        gst = it.get("gstRate") or 0
+        amt = it["qty"] * it["rate"] * (1 - disc / 100)
+        items_html += f"""<tr>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;color:#64748b">{idx}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-weight:600">{it.get("name","")}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;color:#64748b">{it.get("hsn","")}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right">{it["qty"]} {it.get("unit","")}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right">₹{it["rate"]:,.2f}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;color:{'#16a34a' if gst==0 else '#64748b'}">{gst}%</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;font-weight:600">₹{amt:,.2f}</td>
+        </tr>"""
+
+    valid_till = ""
+    try:
+        from datetime import datetime, timedelta
+        created = q.get("createdAt","")[:10]
+        vdays = int(q.get("validDays") or 30)
+        dt = datetime.strptime(created, "%Y-%m-%d") + timedelta(days=vdays)
+        valid_till = dt.strftime("%d %b %Y")
+    except: pass
+
+    html_body = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif">
+<div style="max-width:680px;margin:32px auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+  <div style="background:linear-gradient(135deg,#0f4c35,#166534);padding:28px 36px;color:#fff">
+    <div style="font-size:24px;font-weight:800">GLC Zone</div>
+    <div style="font-size:11px;color:rgba(255,255,255,.7);margin-top:4px">GLC Zone Private Limited | GSTIN: 10FZTPA0354J1ZJ | Kishanganj, Bihar</div>
+    <div style="margin-top:16px;font-size:20px;font-weight:700;font-family:monospace">{q.get("quoteNo","")}</div>
+    <div style="font-size:11px;color:rgba(255,255,255,.6);margin-top:2px">Date: {q.get("createdAt","")[:10]}{" · Valid till: " + valid_till if valid_till else ""}</div>
+  </div>
+  <div style="padding:28px 36px">
+    <p style="font-size:14px;color:#1e293b;margin-bottom:20px">Dear <strong>{q.get("customerName","")}</strong>,</p>
+    <p style="font-size:13px;color:#64748b;margin-bottom:24px">Thank you for your interest in GLC Zone. Please find your quotation details below.</p>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
+      <thead><tr style="background:#0f4c35">
+        <th style="padding:10px 12px;color:#fff;text-align:left;font-size:11px;text-transform:uppercase">#</th>
+        <th style="padding:10px 12px;color:#fff;text-align:left;font-size:11px;text-transform:uppercase">Item</th>
+        <th style="padding:10px 12px;color:#fff;text-align:left;font-size:11px;text-transform:uppercase">HSN</th>
+        <th style="padding:10px 12px;color:#fff;text-align:right;font-size:11px;text-transform:uppercase">Qty</th>
+        <th style="padding:10px 12px;color:#fff;text-align:right;font-size:11px;text-transform:uppercase">Rate</th>
+        <th style="padding:10px 12px;color:#fff;text-align:right;font-size:11px;text-transform:uppercase">GST</th>
+        <th style="padding:10px 12px;color:#fff;text-align:right;font-size:11px;text-transform:uppercase">Amount</th>
+      </tr></thead>
+      <tbody>{items_html}</tbody>
+    </table>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:24px">
+      <div style="width:260px;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden">
+        <div style="display:flex;justify-content:space-between;padding:8px 16px;font-size:12.5px;border-bottom:1px solid #f1f5f9"><span>Subtotal</span><span>₹{q.get("subtotal",0):,.2f}</span></div>
+        <div style="display:flex;justify-content:space-between;padding:8px 16px;font-size:12.5px;color:#64748b;border-bottom:1px solid #f1f5f9"><span>{"CGST + SGST" if q.get("cgst") else "IGST"}</span><span>₹{(q.get("cgst",0)*2 if q.get("cgst") else q.get("igst",0)):,.2f}</span></div>
+        <div style="display:flex;justify-content:space-between;padding:10px 16px;font-size:14px;font-weight:700;background:#0f4c35;color:#fff"><span>Grand Total</span><span>₹{q.get("total",0):,.2f}</span></div>
+      </div>
+    </div>
+    {"<div style='background:#fffbeb;border:1px solid #fef3c7;border-radius:8px;padding:12px 16px;margin-bottom:16px'><div style='font-size:10px;color:#92400e;font-weight:600;text-transform:uppercase;margin-bottom:4px'>Notes</div><div style='font-size:12px;color:#78350f'>" + q.get("notes","") + "</div></div>" if q.get("notes") else ""}
+    {"<div style='background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:12px 16px;margin-bottom:16px'><div style='font-size:10px;color:#0369a1;font-weight:600;text-transform:uppercase;margin-bottom:4px'>Terms & Conditions</div><div style='font-size:12px;color:#0c4a6e'>" + q.get("terms","") + "</div></div>" if q.get("terms") else ""}
+    <p style="font-size:13px;color:#64748b;margin-top:24px">For any queries, please contact us at <strong>bdey@glczone.in</strong> or call <strong>+91 89691 25123</strong>.</p>
+    <p style="font-size:13px;color:#1e293b;margin-top:8px">Thank you for your business! 🙏</p>
+  </div>
+  <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 36px;text-align:center;font-size:11px;color:#94a3b8">
+    <strong style="color:#64748b">GLC Zone Private Limited</strong> · CIN: U68100BR2025PTC077112 · GSTIN: 10FZTPA0354J1ZJ<br>
+    This is a computer-generated quotation and does not require a physical signature.
+  </div>
+</div></body></html>"""
+
+    import aiosmtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Quotation {q.get('quoteNo','')} from GLC Zone — ₹{q.get('total',0):,.0f}"
+    msg["From"] = "GLC Zone <bdey@glczone.in>"
+    msg["To"] = customer_email
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    try:
+        await aiosmtplib.send(
+            msg,
+            hostname="smtp.gmail.com",
+            port=587,
+            start_tls=True,
+            username="bdey@glczone.in",
+            password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""),
+        )
+        await db.quotations.update_one({"id": qid}, {"$set": {"status": "SENT", "updatedAt": now_iso()}})
+        return {"ok": True, "sent_to": customer_email}
+    except Exception as e:
+        raise HTTPException(500, f"Email failed: {str(e)}")
+
+
 @api.post("/quotations/{qid}/convert")
 async def convert_quote_to_order(qid: str, user=Depends(current_user)):
     q = await db.quotations.find_one({"id": qid}, {"_id": 0})
@@ -492,7 +903,7 @@ async def convert_quote_to_order(qid: str, user=Depends(current_user)):
         "igst": q["igst"],
         "total": q["total"],
         "status": "CONFIRMED",
-        "store": q.get("vertical") or "GLC Store",
+        "store": q.get("vertical") or "GLC Zone",
         "vertical": q.get("vertical"),
         "quotationId": qid,
         "createdAt": now_iso(),
@@ -517,7 +928,7 @@ class OrderIn(BaseModel):
     customerGst: Optional[str] = None
     customerState: Optional[str] = None
     items: List[QuoteItem] = []
-    store: str = "GLC Store"
+    store: str = "GLC Zone"
     vertical: Optional[str] = None
     status: str = "PENDING"
     notes: Optional[str] = None
@@ -571,11 +982,40 @@ async def delete_order(oid: str, user=Depends(current_user)):
     return {"ok": True}
 
 
+async def current_user_optional(request: Request):
+    """JWT optional — None return karta hai agar token nahi."""
+    try:
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        token = auth.split(" ", 1)[1]
+        return await current_user(token)
+    except Exception:
+        return None
+
+async def current_user_or_secret(request: Request):
+    """GLC_BRIDGE_AUTH: JWT login ya X-CRM-Secret header dono accept karta hai."""
+    secret = os.environ.get("CRM_BRIDGE_SECRET", "")
+    if secret and request.headers.get("X-CRM-Secret") == secret:
+        return {"id": "system", "role": "system"}
+    user = await current_user_optional(request)
+    if user:
+        return user
+    raise HTTPException(401, "Unauthorized")
+
+
 @api.post("/orders/{oid}/invoice")
-async def generate_invoice(oid: str, user=Depends(current_user)):
+async def generate_invoice(oid: str, request: Request, user=Depends(current_user_or_secret)):
+    # GLC_BRIDGE_AUTH: JWT ya X-CRM-Secret dono se kaam kare
+    # id, externalId, ya orderNo (GLZ-25) teeno se dhundho
     o = await db.sales_orders.find_one({"id": oid}, {"_id": 0})
     if not o:
+        o = await db.sales_orders.find_one({"externalId": str(oid)}, {"_id": 0})
+    if not o:
+        o = await db.sales_orders.find_one({"orderNo": str(oid)}, {"_id": 0})
+    if not o:
         raise HTTPException(404, "Not found")
+    oid = o["id"]  # ab CRM ka internal UUID use karo
     exists = await db.invoices.find_one({"orderId": oid}, {"_id": 0})
     if exists:
         return exists
@@ -588,12 +1028,15 @@ async def generate_invoice(oid: str, user=Depends(current_user)):
         "customerName": o["customerName"],
         "customerGst": o.get("customerGst"),
         "customerState": o.get("customerState"),
-        "items": o["items"],
-        "subtotal": o["subtotal"],
-        "cgst": o["cgst"],
-        "sgst": o["sgst"],
-        "igst": o["igst"],
-        "total": o["total"],
+        "items": (lambda v, tot: v if isinstance(v, list) else (
+            [{"name": v.strip(), "qty": 1, "price": tot, "rate": tot, "total": tot, "hsn": "", "gst": 0, "amount": tot}]
+            if isinstance(v, str) and v else []
+        ))(o.get("items") or o.get("products"), o.get("finalTotal") or o.get("total") or 0),
+        "subtotal": o.get("subtotal") or o.get("finalTotal") or o.get("total") or 0,
+        "cgst": o.get("cgst") or 0,
+        "sgst": o.get("sgst") or 0,
+        "igst": o.get("igst") or 0,
+        "total": o.get("total") or o.get("finalTotal") or 0,
         "paidAmount": 0,
         "dueAmount": o["total"],
         "status": "UNPAID",
@@ -1284,12 +1727,292 @@ async def create_ticket(data: TicketIn, user=Depends(current_user)):
     return clean(doc)
 
 
+# glczone.in ticket status (numeric) <-> CRM status (string) mapping
+GLCZONE_TICKET_STATUS_TO_CRM = {1: "PENDING", 2: "OPEN", 3: "RESOLVED", 4: "CLOSED", 5: "REOPENED"}
+CRM_TICKET_STATUS_TO_GLCZONE = {"PENDING": 1, "OPEN": 2, "RESOLVED": 3, "CLOSED": 4, "REOPENED": 5}
+
+async def push_ticket_status_to_glczone(glczone_ticket_id: str, crm_status: str):
+    """Two-way sync: CRM se ticket status badalne par glczone.in par bhi reflect karo."""
+    import httpx, os
+    glczone_status = CRM_TICKET_STATUS_TO_GLCZONE.get(crm_status)
+    if glczone_status is None:
+        return
+    secret = os.getenv("CRM_BRIDGE_SECRET", "")
+    if not secret:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                "https://glczone.in/api/crm-bridge/tickets/resolve",
+                headers={"X-Crm-Bridge-Secret": secret},
+                data={"ticket_id": glczone_ticket_id, "status": str(glczone_status)},
+            )
+    except Exception as e:
+        log.warning(f"Failed to push ticket status to glczone: {e}")
+
+
 @api.put("/tickets/{tid}")
 async def update_ticket(tid: str, body: Dict[str, Any], user=Depends(current_user)):
     body["updatedAt"] = now_iso()
     await db.tickets.update_one({"id": tid}, {"$set": body})
     d = await db.tickets.find_one({"id": tid}, {"_id": 0})
+
+    # Agar yeh ticket glczone.in se synced hai aur status badla hai, to wahan bhi push karo
+    if d and d.get("glczone_ticket_id") and "status" in body:
+        await push_ticket_status_to_glczone(d["glczone_ticket_id"], body["status"])
+
     return d
+
+
+# ===================== REAL-TIME ORDER WEBHOOK (glczone.in -> CRM, instant push) =====================
+
+@api.post("/webhooks/order-event")
+async def order_event_webhook(request: Request):
+    """glczone.in calls this the instant an order is created or its status changes.
+    Protected by the same shared secret as the CRM bridge. Upserts sales_orders
+    and deals so the CRM reflects it immediately, without waiting for the 15-min cron."""
+    import os
+    secret = request.headers.get("X-Crm-Bridge-Secret", "")
+    expected = os.getenv("CRM_BRIDGE_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(401, "Unauthorized")
+
+    body = await request.json()
+    order_id = str(body.get("order_id", ""))
+    status = body.get("status", "")
+    customer_name = body.get("customer_name", "")
+    customer_phone = body.get("customer_phone", "")
+    customer_email = body.get("customer_email", "")
+    total = float(body.get("total", 0) or 0)
+    vertical = body.get("vertical", "GLC Zone")
+
+    if not order_id:
+        raise HTTPException(400, "order_id required")
+
+    data = {
+        "glczone_order_id": order_id,
+        "orderNo": f"#{order_id}",
+        "customerName": customer_name,
+        "customerPhone": customer_phone,
+        "customerEmail": customer_email,
+        "status": status,
+        "total": total,
+        "vertical": vertical,
+        "source": "glczone.in",
+        "realtimeSync": True,
+        "updatedAt": now_iso(),
+    }
+
+    rider = body.get("rider") or {}
+    zone = body.get("zone") or {}
+    addr = body.get("address") or {}
+    addr_text = ", ".join(str(x) for x in [addr.get("line"), addr.get("landmark"), addr.get("city"), addr.get("pincode")] if x)
+    for k_src, k_dst in (("final_total", "finalTotal"), ("payment_method", "paymentMethod"), ("payment_status", "paymentStatus")):
+        if body.get(k_src) is not None:
+            data[k_dst] = body.get(k_src)
+    if body.get("items") is not None:
+        data["glczoneItems"] = body.get("items")
+    if addr_text:
+        data["deliveryAddress"] = addr_text
+    if body.get("ward"):
+        data["ward"] = body.get("ward")
+    if zone.get("name"):
+        data["zone"] = zone.get("name")
+    if rider.get("name"):
+        data["deliveryBoy"] = rider.get("name")
+
+    existing = await db.sales_orders.find_one({"glczone_order_id": order_id})
+    if existing:
+        await db.sales_orders.update_one({"glczone_order_id": order_id}, {"$set": data})
+    else:
+        data["id"] = uid()
+        data["createdAt"] = now_iso()
+        await db.sales_orders.insert_one(data)
+
+    deal_existing = await db.deals.find_one({"glczone_order_id": order_id})
+    deal_data = {
+        "glczone_order_id": order_id,
+        "title": f"Order #{order_id} — {customer_name}",
+        "customerName": customer_name,
+        "customerPhone": customer_phone,
+        "value": total,
+        "stage": "WON" if status == "delivered" else ("LOST" if status in ("cancelled", "returned") else "NEW"),
+        "glczone_status": status,
+        "vertical": vertical,
+        "source": "glczone.in",
+        "updatedAt": now_iso(),
+    }
+    if deal_existing:
+        await db.deals.update_one({"glczone_order_id": order_id}, {"$set": deal_data})
+    else:
+        deal_data["id"] = uid()
+        deal_data["probability"] = 50
+        deal_data["createdAt"] = now_iso()
+        await db.deals.insert_one(deal_data)
+
+    ds = str(body.get("delivery_status") or "").lower()
+    if ds == "delivered" or status == "delivered":
+        d_status = "DELIVERED"
+    elif status in ("cancelled", "returned") or ds == "cancelled":
+        d_status = "CANCELLED"
+    elif ds == "out_for_delivery":
+        d_status = "IN_TRANSIT"
+    elif rider.get("name"):
+        d_status = "ASSIGNED"
+    else:
+        d_status = "PENDING"
+    d_doc = {
+        "glczone_order_id": order_id,
+        "orderNo": f"GLZ-{order_id}",
+        "customerName": customer_name,
+        "customerPhone": customer_phone,
+        "deliveryAddress": addr_text,
+        "deliveryBoy": rider.get("name") or "Unassigned",
+        "riderId": rider.get("id"),
+        "zone": zone.get("name"),
+        "ward": body.get("ward"),
+        "items": body.get("items") or [],
+        "status": d_status,
+        "source": "glczone.in",
+        "updatedAt": now_iso(),
+    }
+    d_doc = {k: v for k, v in d_doc.items() if v not in (None, "", [])}
+    if await db.deliveries.find_one({"glczone_order_id": order_id}, {"_id": 0}):
+        await db.deliveries.update_one({"glczone_order_id": order_id}, {"$set": d_doc})
+    else:
+        d_doc["id"] = uid()
+        d_doc["createdAt"] = now_iso()
+        await db.deliveries.insert_one(d_doc)
+
+    log.info(f"Real-time order webhook processed: order_id={order_id}, status={status}")
+    return {"ok": True, "message": "Order event processed in real-time"}
+
+
+# ===================== WITHDRAWALS (Two-way sync with glczone.in) =====================
+
+async def call_glczone_bridge(path: str, data: dict):
+    import httpx, os
+    secret = os.getenv("CRM_BRIDGE_SECRET", "")
+    if not secret:
+        return {"error": True, "message": "CRM_BRIDGE_SECRET not configured"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://glczone.in/api/crm-bridge/{path}",
+                headers={"X-Crm-Bridge-Secret": secret},
+                data=data,
+            )
+            return resp.json()
+    except Exception as e:
+        log.warning(f"CRM bridge call failed ({path}): {e}")
+        return {"error": True, "message": str(e)}
+
+
+@api.get("/withdrawals")
+async def list_withdrawals(page: int = 1, limit: int = 50, status_: Optional[str] = Query(None, alias="status"), user=Depends(current_user)):
+    q = {}
+    if status_:
+        q["status"] = status_
+    skip = (page - 1) * limit
+    items = await db.withdrawals.find(q, {"_id": 0}).sort("createdAt", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.withdrawals.count_documents(q)
+    return {"items": items, "total": total, "page": page, "limit": limit}
+
+
+@api.post("/withdrawals/{wid}/approve")
+async def approve_withdrawal(wid: str, user=Depends(current_user)):
+    w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
+    if not w:
+        raise HTTPException(404, "Withdrawal not found")
+
+    result = await call_glczone_bridge(f"withdrawals/{w['glczone_withdrawal_id']}/approve", {})
+    if result.get("error"):
+        raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
+
+    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "approved", "updatedAt": now_iso()}})
+    return {"ok": True, "message": "Withdrawal approved on glczone.in and CRM"}
+
+
+@api.post("/withdrawals/{wid}/reject")
+async def reject_withdrawal(wid: str, body: Dict[str, Any], user=Depends(current_user)):
+    w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
+    if not w:
+        raise HTTPException(404, "Withdrawal not found")
+
+    reason = body.get("reason", "")
+    result = await call_glczone_bridge(f"withdrawals/{w['glczone_withdrawal_id']}/reject", {"reason": reason})
+    if result.get("error"):
+        raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
+
+    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "rejected", "updatedAt": now_iso()}})
+    return {"ok": True, "message": "Withdrawal rejected and refunded on glczone.in"}
+
+
+@api.post("/withdrawals/{wid}/mark-paid")
+async def mark_withdrawal_paid(wid: str, body: Dict[str, Any], user=Depends(current_user)):
+    w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
+    if not w:
+        raise HTTPException(404, "Withdrawal not found")
+
+    payment_reference = body.get("payment_reference", "")
+    result = await call_glczone_bridge(f"withdrawals/{w['glczone_withdrawal_id']}/mark-paid", {"payment_reference": payment_reference})
+    if result.get("error"):
+        raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
+
+    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "paid", "updatedAt": now_iso()}})
+    return {"ok": True, "message": "Withdrawal marked as paid"}
+
+
+# ===================== RETURN REQUESTS (Two-way sync with glczone.in) =====================
+
+@api.get("/returns")
+async def list_returns(page: int = 1, limit: int = 50, status_: Optional[str] = Query(None, alias="status"), user=Depends(current_user)):
+    q = {}
+    if status_:
+        q["status"] = status_
+    skip = (page - 1) * limit
+    items = await db.returns.find(q, {"_id": 0}).sort("createdAt", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.returns.count_documents(q)
+    return {"items": items, "total": total, "page": page, "limit": limit}
+
+
+@api.post("/returns/{rid}/approve")
+async def approve_return(rid: str, user=Depends(current_user)):
+    r = await db.returns.find_one({"id": rid}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Return request not found")
+
+    result = await call_glczone_bridge("returns/update", {
+        "return_request_id": r["glczone_return_id"],
+        "status": "1",
+        "order_item_id": r.get("productId", "0"),
+        "update_remarks": "Approved via CRM",
+    })
+    if result.get("error"):
+        raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
+
+    await db.returns.update_one({"id": rid}, {"$set": {"status": "APPROVED", "updatedAt": now_iso()}})
+    return {"ok": True, "message": "Return approved on glczone.in and CRM"}
+
+
+@api.post("/returns/{rid}/reject")
+async def reject_return(rid: str, body: Dict[str, Any], user=Depends(current_user)):
+    r = await db.returns.find_one({"id": rid}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Return request not found")
+
+    reason = body.get("reason", "")
+    result = await call_glczone_bridge("returns/update", {
+        "return_request_id": r["glczone_return_id"],
+        "status": "2",
+        "order_item_id": r.get("productId", "0"),
+        "update_remarks": reason,
+    })
+    if result.get("error"):
+        raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
+
+    await db.returns.update_one({"id": rid}, {"$set": {"status": "REJECTED", "updatedAt": now_iso()}})
+    return {"ok": True, "message": "Return rejected on glczone.in and CRM"}
 
 
 @api.post("/tickets/{tid}/reply")
@@ -1339,14 +2062,75 @@ async def delete_document(did: str, user=Depends(current_user)):
 # =========================================================
 @api.get("/notifications")
 async def list_notifications(user=Depends(current_user)):
-    items = await db.notifications.find({"userId": {"$in": [user["id"], "*"]}}, {"_id": 0}).sort("createdAt", -1).limit(50).to_list(50)
-    unread = sum(1 for n in items if not n.get("isRead"))
-    return {"items": items, "unread": unread}
+    # Real-time alerts from live data
+    alerts = []
+
+    # 1. Pending leaves
+    pending_leaves = await db.leaves.count_documents({"status": "PENDING"})
+    if pending_leaves > 0:
+        alerts.append({"id": "leave-pending", "title": "Leave Requests Pending", "message": f"{pending_leaves} employee leave request(s) awaiting approval", "type": "leave", "isRead": False, "createdAt": now_iso(), "url": "/hr/leaves"})
+
+    # 2. Low stock
+    low_stock = await db.stock_items.count_documents({"qty": {"$lt": 10, "$gt": 0}})
+    if low_stock > 0:
+        alerts.append({"id": "low-stock", "title": "Low Stock Alert", "message": f"{low_stock} product(s) running low on stock", "type": "stock", "isRead": False, "createdAt": now_iso(), "url": "/inventory/stock"})
+
+    # 3. Pending withdrawals
+    pending_w = await db.withdrawals.count_documents({"status": "PENDING"})
+    if pending_w > 0:
+        alerts.append({"id": "withdrawal-pending", "title": "Withdrawal Requests", "message": f"{pending_w} seller withdrawal(s) pending approval", "type": "withdrawal", "isRead": False, "createdAt": now_iso(), "url": "/sellers"})
+
+    # 4. Pending returns
+    pending_r = await db.returns.count_documents({"status": "PENDING"})
+    if pending_r > 0:
+        alerts.append({"id": "return-pending", "title": "Return Requests", "message": f"{pending_r} customer return(s) awaiting action", "type": "return", "isRead": False, "createdAt": now_iso(), "url": "/sellers"})
+
+    # 5. Unpaid invoices
+    unpaid = await db.invoices.count_documents({"status": {"$in": ["UNPAID", "OVERDUE"]}})
+    if unpaid > 0:
+        alerts.append({"id": "unpaid-invoices", "title": "Unpaid Invoices", "message": f"{unpaid} invoice(s) are unpaid or overdue", "type": "invoice", "isRead": False, "createdAt": now_iso(), "url": "/sales/invoices"})
+
+    # 6. New leads today
+    today = now_iso()[:10]
+    new_leads = await db.leads.count_documents({"createdAt": {"$regex": f"^{today}"}})
+    if new_leads > 0:
+        alerts.append({"id": "new-leads", "title": "New Leads Today", "message": f"{new_leads} new lead(s) added today", "type": "lead", "isRead": False, "createdAt": now_iso(), "url": "/crm/leads"})
+
+    # 7. Pending deliveries
+    pending_d = await db.deliveries.count_documents({"status": "PENDING"})
+    if pending_d > 0:
+        alerts.append({"id": "pending-deliveries", "title": "Pending Deliveries", "message": f"{pending_d} delivery(ies) not yet assigned", "type": "delivery", "isRead": False, "createdAt": now_iso(), "url": "/delivery"})
+
+    # 8. Scheduled social posts due today
+    due_posts = await db.social_posts.count_documents({"status": "SCHEDULED", "scheduledAt": {"$lte": now_iso()}})
+    if due_posts > 0:
+        alerts.append({"id": "due-posts", "title": "Social Posts Due", "message": f"{due_posts} scheduled post(s) ready to publish", "type": "social", "isRead": False, "createdAt": now_iso(), "url": "/ocm/social"})
+
+    # Also fetch stored notifications
+    stored = await db.notifications.find({"userId": {"$in": [user["id"], "*"]}}, {"_id": 0}).sort("createdAt", -1).limit(20).to_list(20)
+
+    # Merge — stored ones first, then live alerts
+    read_ids = {n["id"] for n in stored if n.get("isRead")}
+    for a in alerts:
+        if a["id"] in read_ids:
+            a["isRead"] = True
+
+    all_items = alerts + [s for s in stored if s.get("id") not in {a["id"] for a in alerts}]
+    unread = sum(1 for n in all_items if not n.get("isRead"))
+    return {"items": all_items[:30], "unread": unread}
 
 
 @api.put("/notifications/read-all")
 async def mark_all_read(user=Depends(current_user)):
     await db.notifications.update_many({"userId": {"$in": [user["id"], "*"]}}, {"$set": {"isRead": True}})
+    # Store read state for live alerts
+    live_ids = ["leave-pending","low-stock","withdrawal-pending","return-pending","unpaid-invoices","new-leads","pending-deliveries","due-posts"]
+    for lid in live_ids:
+        existing = await db.notifications.find_one({"id": lid})
+        if existing:
+            await db.notifications.update_one({"id": lid}, {"$set": {"isRead": True}})
+        else:
+            await db.notifications.insert_one({"id": lid, "userId": user["id"], "isRead": True, "createdAt": now_iso()})
     return {"ok": True}
 
 
@@ -1407,7 +2191,7 @@ async def dashboard(vertical: Optional[str] = None, user=Depends(current_user)):
 
     open_tickets = await db.tickets.count_documents({"status": {"$in": ["OPEN", "IN_PROGRESS"]}})
     total_leads = await db.leads.count_documents({})
-    pending_deliveries = await db.deliveries.count_documents({"status": {"$in": ["PENDING", "ASSIGNED", "IN_TRANSIT"]}})
+    pending_deliveries = await db.deliveries.count_documents({"status": {"$in": ["PENDING", "ASSIGNED", "IN_TRANSIT", "RECEIVED", "PROCESSED", "PROCESSING", "SHIPPED"]}})
     employee_count = await db.employees.count_documents({})
 
     today_attn = await db.attendance.count_documents({"date": today, "status": "PRESENT"})
@@ -1510,14 +2294,49 @@ ROLE_PERMS = {
     "Sales": ["dashboard", "crm", "sales", "inventory.products", "delivery", "documents", "ocm"],
     "Accounts": ["dashboard", "sales.invoices", "finance", "purchase", "documents", "hr.payroll"],
     "HR": ["dashboard", "hr", "documents"],
+    "Catalog Manager": ["dashboard", "inventory.products", "documents"],
+    "Logistics Manager": ["dashboard", "delivery", "sales.orders", "documents"],
+    "Warehouse Manager": ["dashboard", "inventory.stock", "purchase", "documents"],
+    "Seller Relations Manager": ["dashboard", "purchase.suppliers", "documents"],
+    "Telecaller": ["dashboard", "crm.leads", "crm.customers", "tasks", "documents"],
+    "Finance Staff": ["dashboard", "finance", "sales.invoices", "documents"],
+    "Marketing Manager": ["dashboard", "ocm", "documents"],
+    "System Admin": ["dashboard", "settings", "audit", "documents"],
 }
 
 
 @api.get("/rbac/me")
 async def rbac_me(user=Depends(current_user)):
     role = user.get("role", "Admin")
-    perms = ROLE_PERMS.get(role, ["dashboard"])
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    perms = perms_map.get(role, ROLE_PERMS.get(role, ["dashboard"]))
     return {"role": role, "modules": perms}
+
+
+class RbacSyncIn(BaseModel):
+    permissions_json: str
+    sig: str
+
+
+@api.post("/rbac/sync")
+async def rbac_sync(data: RbacSyncIn):
+    if not CRM_SSO_SECRET:
+        raise HTTPException(500, "Sync not configured")
+    expected_sig = hmac.new(CRM_SSO_SECRET.encode(), data.permissions_json.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, data.sig):
+        raise HTTPException(401, "Invalid sync signature")
+    import json as _json
+    try:
+        permissions = _json.loads(data.permissions_json)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+    await db.settings.update_one(
+        {"key": "role_perms"},
+        {"$set": {"value": permissions}},
+        upsert=True,
+    )
+    return {"ok": True}
 
 
 # =========================================================
@@ -1651,6 +2470,15 @@ async def ocm_send_message(cid: str, body: OcmMessageIn, user=Depends(current_us
     conv = await db.ocm_conversations.find_one({"id": cid}, {"_id": 0})
     if not conv:
         raise HTTPException(404, "Not found")
+
+    send_status = "SENT"
+    channel = conv.get("channel", "WEBCHAT")
+    if channel in ("WHATSAPP", "INSTAGRAM", "FACEBOOK") and (body.direction or "OUT") == "OUT":
+        contact = await db.ocm_contacts.find_one({"id": conv.get("contactId")}, {"_id": 0}) or {}
+        result = send_platform_message(channel, contact, body.text)
+        if not result.get("success"):
+            send_status = "FAILED"
+
     msg = {
         "id": uid(),
         "conversationId": cid,
@@ -1659,11 +2487,12 @@ async def ocm_send_message(cid: str, body: OcmMessageIn, user=Depends(current_us
         "text": body.text,
         "sentBy": user["name"],
         "sentById": user["id"],
-        "status": "SENT",
+        "status": send_status,
         "createdAt": now_iso(),
     }
     await db.ocm_messages.insert_one(msg)
-    await db.ocm_conversations.update_one({"id": cid}, {"$set": {"lastMessage": body.text, "lastMessageAt": now_iso()}})
+    # Agent ne reply kiya — agentMode on karo (AI band)
+    await db.ocm_conversations.update_one({"id": cid}, {"$set": {"lastMessage": body.text, "lastMessageAt": now_iso(), "agentMode": True, "agentId": user["id"], "agentName": user["name"]}})
     return clean(msg)
 
 
@@ -1699,14 +2528,1499 @@ async def ocm_create_broadcast(data: BroadcastIn, user=Depends(current_user)):
 
 @api.post("/ocm/broadcasts/{bid}/send")
 async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
-    """Mocked send — no external channel calls in this cycle."""
+    """Sends the broadcast message on each selected channel to all subscribed contacts that have that channel's contact id."""
     b = await db.ocm_broadcasts.find_one({"id": bid}, {"_id": 0})
     if not b:
         raise HTTPException(404, "Not found")
-    n = await db.ocm_contacts.count_documents({"subscribed": True})
-    await db.ocm_broadcasts.update_one({"id": bid}, {"$set": {"status": "SENT", "sentAt": now_iso(), "sentCount": n, "deliveredCount": int(n * 0.94), "readCount": int(n * 0.62)}})
-    await log_activity(user["id"], "ocm.broadcasts", "send", bid, {"channels": b.get("channels"), "recipients": n})
-    return {"ok": True, "recipients": n}
+
+    channels = b.get("channels") or ["TELEGRAM"]
+    message = b.get("message") or ""
+    audience = b.get("audience") or "ALL"
+
+    sent_count = 0
+    failed_count = 0
+    seen_recipients = set()
+
+    for channel in channels:
+        field = CHANNEL_CONTACT_FIELD.get(channel)
+        if not field:
+            continue
+        query = {"subscribed": True, field: {"$exists": True, "$ne": None, "$ne": ""}}
+        if audience != "ALL":
+            query["tags"] = audience.lower()
+        contacts = await db.ocm_contacts.find(query, {"_id": 0}).to_list(5000)
+
+        for contact in contacts:
+            recipient = contact.get(field)
+            if not recipient:
+                continue
+            dedupe_key = (channel, recipient)
+            if dedupe_key in seen_recipients:
+                continue
+            seen_recipients.add(dedupe_key)
+            try:
+                if channel == "WHATSAPP":
+                    result = send_whatsapp_text(recipient, message)
+                elif channel == "TELEGRAM":
+                    result = send_telegram_text(recipient, message)
+                elif channel in ("INSTAGRAM", "FACEBOOK"):
+                    result = send_messenger_style_text(recipient, message)
+                else:
+                    result = {"success": False, "error": f"Unsupported channel {channel}"}
+            except Exception as e:
+                result = {"success": False, "error": str(e)}
+
+            if result.get("success"):
+                sent_count += 1
+            else:
+                failed_count += 1
+                log.warning(f"Broadcast {bid}: failed to send to {recipient} via {channel}: {result.get('error')}")
+
+        # Also reach GlcZone e-commerce customers directly by phone (WhatsApp only for now)
+        if channel == "WHATSAPP":
+            cust_query = {"phone": {"$exists": True, "$ne": None, "$ne": ""}}
+            if audience != "ALL":
+                cust_query["type"] = audience
+            glczone_customers = await db.customers.find(cust_query, {"_id": 0, "phone": 1}).to_list(20000)
+            for cust in glczone_customers:
+                raw_phone = (cust.get("phone") or "").strip()
+                digits = "".join(ch for ch in raw_phone if ch.isdigit())
+                if len(digits) == 10:
+                    recipient = "91" + digits
+                elif len(digits) == 12 and digits.startswith("91"):
+                    recipient = digits
+                else:
+                    continue
+                if recipient == "910000000000" or digits == "0000000000":
+                    continue
+                dedupe_key = (channel, recipient)
+                if dedupe_key in seen_recipients:
+                    continue
+                seen_recipients.add(dedupe_key)
+                try:
+                    result = send_whatsapp_text(recipient, message)
+                except Exception as e:
+                    result = {"success": False, "error": str(e)}
+
+                if result.get("success"):
+                    sent_count += 1
+                else:
+                    failed_count += 1
+                    err = result.get("error")
+                    log.warning(f"Broadcast {bid}: failed to send to GlcZone customer {recipient}: {err}")
+
+    await db.ocm_broadcasts.update_one(
+        {"id": bid},
+        {"$set": {
+            "status": "SENT",
+            "sentAt": now_iso(),
+            "sentCount": sent_count,
+            "failedCount": failed_count,
+            "deliveredCount": sent_count,
+            "readCount": 0,
+        }}
+    )
+    await log_activity(user["id"], "ocm.broadcasts", "send", bid, {"channels": channels, "sent": sent_count, "failed": failed_count})
+    return {"ok": True, "sent": sent_count, "failed": failed_count}
+
+
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_API_VERSION = "v20.0"
+
+
+def send_whatsapp_text(to_phone: str, text: str) -> dict:
+    """Send a free-form WhatsApp text message (only valid within the 24h customer service window)."""
+    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        log.warning("WhatsApp send skipped: credentials not configured")
+        return {"success": False, "error": "WhatsApp credentials not configured"}
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "text",
+        "text": {"body": text},
+    }
+    try:
+        r = requests.post(url, json=payload, headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}, timeout=15)
+        return {"success": r.status_code == 200, "response": r.json()}
+    except Exception as e:
+        log.exception(f"WhatsApp send failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def send_messenger_style_text(recipient_id: str, text: str) -> dict:
+    """Send a DM via the Messenger Platform Send API — used for both Instagram DMs and Facebook Messenger."""
+    if not FB_PAGE_ACCESS_TOKEN:
+        log.warning("Messenger send skipped: FB_PAGE_ACCESS_TOKEN not configured")
+        return {"success": False, "error": "Facebook Page not configured"}
+    url = f"https://graph.facebook.com/{FB_API_VERSION}/me/messages"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text},
+        "messaging_type": "RESPONSE",
+    }
+    try:
+        r = requests.post(url, json=payload, params={"access_token": FB_PAGE_ACCESS_TOKEN}, timeout=15)
+        return {"success": r.status_code == 200, "response": r.json()}
+    except Exception as e:
+        log.exception(f"Messenger-style send failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+CHANNEL_CONTACT_FIELD = {
+    "WHATSAPP": "whatsappId",
+    "INSTAGRAM": "instagramId",
+    "FACEBOOK": "facebookId",
+    "TELEGRAM": "telegramId",
+}
+
+
+def send_telegram_text(chat_id: str, text: str) -> dict:
+    """Send a message via Telegram Bot API."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        log.warning("Telegram send skipped: TELEGRAM_BOT_TOKEN not configured")
+        return {"success": False, "error": "Telegram not configured"}
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=15
+        )
+        body = r.json()
+        if r.status_code == 200 and body.get("ok"):
+            return {"success": True, "messageId": body["result"]["message_id"]}
+        return {"success": False, "error": body.get("description", "Telegram error")}
+    except Exception as e:
+        log.exception(f"Telegram send failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def send_platform_message(channel: str, contact: dict, text: str) -> dict:
+    """Dispatch an outgoing message to the right platform based on channel."""
+    field = CHANNEL_CONTACT_FIELD.get(channel, "phone")
+    recipient = contact.get(field) or contact.get("phone")
+    if not recipient:
+        return {"success": False, "error": f"No {field} on contact"}
+    if channel == "WHATSAPP":
+        return send_whatsapp_text(recipient, text)
+    elif channel in ("INSTAGRAM", "FACEBOOK"):
+        return send_messenger_style_text(recipient, text)
+    elif channel == "TELEGRAM":
+        return send_telegram_text(recipient, text)
+    else:
+        return {"success": False, "error": f"Sending on {channel} not supported yet"}
+
+
+
+async def lookup_order_status(order_id_str: str, phone: str) -> str:
+    """MySQL se order status fetch karo."""
+    import aiomysql, os, json, re
+    # order number extract karo (#2 ya sirf 2)
+    match = re.search(r'\d+', order_id_str)
+    if not match:
+        return ""
+    order_id = int(match.group())
+    try:
+        conn = await aiomysql.connect(
+            host="127.0.0.1", port=3306,
+            user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""),
+            db="glczone_db", autocommit=True
+        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT o.id, o.total, o.payment_method, o.created_at, oi.status "
+                "FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id "
+                "WHERE o.id = %s LIMIT 1",
+                (order_id,)
+            )
+            row = await cur.fetchone()
+        conn.close()
+        if not row:
+            return f"Order #{order_id} nahi mila is number par."
+        oid, total, payment, created, status_json = row
+        # status JSON parse karo
+        try:
+            status_list = json.loads(status_json or "[]")
+            current_status = status_list[-1][0] if status_list else "received"
+        except Exception:
+            current_status = "received"
+        status_map = {
+            "received": "प्राप्त हो गया ✅",
+            "processing": "तैयार हो रहा है 🔄",
+            "shipped": "रास्ते में है 🚚",
+            "delivered": "डिलीवर हो गया 🎉",
+            "cancelled": "रद्द हो गया ❌",
+        }
+        status_hindi = status_map.get(current_status, current_status)
+        return (f"Order #{oid} की जानकारी:\n"
+                f"💰 कुल: ₹{total}\n"
+                f"💳 Payment: {payment}\n"
+                f"📦 Status: {status_hindi}\n"
+                f"📅 Date: {str(created)[:10]}")
+    except Exception as e:
+        log.exception(f"Order lookup failed: {e}")
+        return ""
+
+
+async def fetch_glczone_context() -> str:
+    """Fetch live data from glczone MySQL for AI context."""
+    import aiomysql, json as _json
+    try:
+        conn = await aiomysql.connect(
+            host="127.0.0.1", port=3306,
+            user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""),
+            db="glczone_db", autocommit=True
+        )
+        async with conn.cursor() as cur:
+            # Live products with prices
+            await cur.execute("""
+                SELECT p.name, (SELECT GROUP_CONCAT(CONCAT(IFNULL(pv.base_qty,0), ':', IFNULL(pv.unit_type,'weight'), ':', CASE WHEN pv.special_price > 0 AND pv.special_price < pv.price THEN pv.special_price ELSE pv.price END) ORDER BY pv.price SEPARATOR '|') FROM product_variants pv WHERE pv.product_id = p.id AND pv.status = 1) AS packs /* GLC_PACKS */, p.stock, c.name as category
+                FROM products p
+                LEFT JOIN categories c ON c.id = p.category_id
+                WHERE p.status = 1
+                ORDER BY c.name, p.name
+                LIMIT 50
+            """)
+            products = await cur.fetchall()
+
+            # Store settings
+            await cur.execute("SELECT value FROM settings WHERE variable = 'business_name' LIMIT 1")
+            biz = await cur.fetchone()
+
+            # Delivery areas - hardcoded since table has no city column
+            areas = [("Kishanganj",), ("Bahadurganj",), ("Thakurganj",)]
+
+        conn.close()
+
+        # Build products section
+        product_lines = []
+        current_cat = None
+        for name, price, stock, cat in products:
+            try:
+                name_parsed = _json.loads(name) if name and name.startswith("{") else {"en": str(name)}
+                name_en = name_parsed.get("en") or name_parsed.get("hi") or str(name)
+            except Exception:
+                name_en = str(name)
+
+            cat_parsed = cat or "General"
+            try:
+                cat_dict = _json.loads(cat_parsed) if cat_parsed.startswith("{") else {"en": cat_parsed}
+                cat_en = cat_dict.get("en") or cat_parsed
+            except Exception:
+                cat_en = cat_parsed
+
+            if cat_en != current_cat:
+                current_cat = cat_en
+                product_lines.append(f"\n  [{cat_en}]")
+
+            stock_status = "In Stock" if (stock or 0) > 0 else "Out of Stock"
+            # GLC_PACKS: har pack ka exact size + price
+            packs_txt = []
+            for part in str(price or "").split("|"):
+                try:
+                    q, ut, pr = part.split(":")
+                    q = int(float(q)); pr = float(pr)
+                    if q <= 0:
+                        size = "1 pack"
+                    elif ut == "volume":
+                        size = f"{q/1000:g}L" if q >= 1000 else f"{q}ml"
+                    elif ut == "count":
+                        size = f"{q} pcs"
+                    else:
+                        size = f"{q/1000:g}kg" if q >= 1000 else f"{q}g"
+                    packs_txt.append(f"{size} ₹{pr:g}")
+                except Exception:
+                    continue
+            price_txt = " | ".join(packs_txt) if packs_txt else "price website pe dekhein"
+            product_lines.append(f"  - {name_en}: {price_txt} ({stock_status})")
+
+        products_text = "\n".join(product_lines) if product_lines else "  - Contact us for current prices"
+
+        # Delivery areas
+        area_names = [a[0] for a in areas if a[0]] if areas else ["Kishanganj"]
+        areas_text = ", ".join(area_names) if area_names else "Kishanganj and nearby areas"
+
+        return f"""
+🏪 LIVE PRODUCT PRICES (updated daily):
+{products_text}
+
+🚚 DELIVERY AREAS: {areas_text}
+"""
+    except Exception as e:
+        log.exception(f"fetch_glczone_context failed: {e}")
+        return "\n🏪 Contact us for current prices and availability.\n"
+
+
+async def run_ai_reply(contact: dict, conversation: dict, incoming_text: str, lang: str = "Hindi", channel: str = "WHATSAPP"):
+    """Fallback: call Groq AI when no chatbot flow matched."""
+    import os, httpx, re
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    if not groq_key:
+        return
+
+    # Order number detect karo — agar customer ne diya to direct lookup
+    phone = contact.get("whatsappId") or contact.get("phone", "")
+    # Order number detect — #4, order 4, order #4, 4th order etc
+    order_match = re.search(r'#(\d+)', incoming_text)
+    if not order_match:
+        # Try natural language: "order 4", "4 number ka order", "#4 ka status"
+        order_keywords = ['order', 'status', 'deliver', 'track', 'kahan', 'kab']
+        if any(kw in incoming_text.lower() for kw in order_keywords):
+            order_match = re.search(r'\b(\d+)\b', incoming_text)
+    if order_match:
+        matched_num = order_match.group(1) if order_match.lastindex and order_match.group(1) else order_match.group()
+        order_info = await lookup_order_status(matched_num, phone)
+        if order_info and "नही मिला" not in order_info:
+            # Direct order info send karo, AI call ki zarurat nahi
+            send_platform_message(channel, contact, order_info)
+            out_msg = {
+                "id": uid(), "conversationId": conversation["id"],
+                "channel": channel, "direction": "OUT",
+                "text": order_info, "sentBy": "AI Assistant",
+                "sentById": "ai", "status": "SENT", "createdAt": now_iso(),
+            }
+            await db.ocm_messages.insert_one(out_msg)
+            await db.ocm_conversations.update_one(
+                {"id": conversation["id"]},
+                {"$set": {"lastMessage": order_info, "lastMessageAt": now_iso()}}
+            )
+            return
+
+    # Fetch live GLC Zone data
+    glczone_context = await fetch_glczone_context()
+    log.info(f"CONTEXT_DEBUG: {glczone_context[:200]}")
+
+    # Last 6 messages fetch karo context ke liye
+    recent_msgs = await db.ocm_messages.find(
+        {"conversationId": conversation["id"]},
+        {"_id": 0}
+    ).sort("createdAt", -1).limit(6).to_list(6)
+    recent_msgs.reverse()
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"You are Zara, a friendly and knowledgeable customer support agent for GLC Zone (glczone.in), an Indian e-commerce platform based in Kishanganj, Bihar. "
+                f"Always reply in {lang} language only. Keep replies concise but helpful — 2-4 lines maximum. Be warm, professional and solution-focused. "
+                "\n\n🏪 ABOUT GLC ZONE:"
+                "\n- GLC Zone is Kishanganj, Bihar's #1 online shopping platform"
+                "\n- Founded by Bishwajeet Dey, GLC Zone Private Limited (GSTIN: 10FZTPA0354J1ZJ)"
+                "\n- Website: glczone.in | Instagram: @glczonecoin | Facebook: GLCZone Market"
+                f"\n{glczone_context}"
+                "\n\n🚚 DELIVERY:"
+                "\n- Delivery time: Within 30-60 minutes for local orders"
+                "\n- Delivery charge: ₹20 flat for orders up to 15kg"
+                "\n- Orders above 15kg: ₹2 per kg charge"
+                "\n- NO free delivery — delivery charge always applies"
+                "\n\n💳 PAYMENT:"
+                "\n- COD (Cash on Delivery) available"
+                "\n- Online payment: UPI, Net Banking, Cards"
+                "\n- GLC Wallet: Add money and pay from wallet"
+                "\n\n🔄 RETURN POLICY:"
+                "\n- Returns accepted within 24 hours for damaged or wrong items"
+                "\n- Send photo proof to our team"
+                "\n- Full refund or replacement guaranteed"
+                "\n\n👥 SPV & COMMISSION SYSTEM:"
+                "\n- SPV = Self Point Value — Selling Price minus Vendor Price ke barabar points milte hain"
+                "\n- SPV cash nahi hai — yeh points hain jo commission calculate karne ke liye use hote hain"
+                "\n- 49% SPV affiliate pool mein jaata hai — 7 levels tak 7% commission"
+                "\n- 4 wallet types: Cash (withdraw), Repurchase (sirf shopping), Reward (max 30% use), Travel"
+                "\n- CSB share: 10,000 SPV = 1 share; monthly dividend milta hai"
+                "\n- Commission delivery ke baad credit hota hai"
+                "\n- Details: glczone.in/wallet par dekhen"
+                "\n\n📞 CUSTOMER CARE:"
+                "\n- Available: 9 AM to 8 PM, Monday to Saturday"
+                "\n- For urgent issues, our team will call back within 2 hours"
+                "\n\n❓ COMMON Q&A:"
+                "\n- Order not delivered? → Ask for Order ID, check status, escalate if needed"
+                "\n- Wrong item received? → Ask for photo, arrange return/replacement"
+                "\n- Payment failed? → Check UPI/bank, retry or use COD"
+                "\n- How to order? → Visit glczone.in, add to cart, choose payment"
+                "\n- Wallet not working? → Check balance, minimum ₹10 required"
+                "\n\n⚠️ RULES FOR ZARA:"
+                "\n- NEVER make up order status — always ask for Order ID (#1, #2 etc)"
+                "\n- NEVER ask for phone number — you already have it"
+                "\n- NEVER repeat the same question twice"
+                "\n- NEVER ask for information you already have"
+                "\n- Give DIRECT answers — no beating around the bush"
+                "\n- If order ID given, look it up IMMEDIATELY without asking again"
+                "\n- Maximum 2-3 lines per reply — be concise"
+                "\n\n🚫 ZARA KYA NAHI KAR SAKTI (website par bhejo):"
+                "\n- Order place nahi kar sakti — glczone.in par jaiye ya app download karein"
+                "\n- Payment process nahi kar sakti — glczone.in par payment karein"
+                "\n- Account create/login nahi kar sakti — glczone.in/login par jaiye"
+                "\n- Order cancel/modify nahi kar sakti — glczone.in/account par jaiye"
+                "\n- Refund process nahi kar sakti — support@glczone.in par mail karein"
+                "\n- NEVER invent product varieties not in LIVE PRICES — only one Mango at ₹130, not Alphonso/Kesar/Desi"
+                "\n- If unsure, say: 'Let me check with our team and get back to you shortly!'"
+                "\n- Always end with a helpful follow-up offer"
+                "\n- Be empathetic — customers may be frustrated"
+                "\n- Use emojis occasionally to keep tone friendly"
+                "\n- NEVER take or process a new order yourself in this chat, and never ask for product/quantity details to build an order — "
+                "if the customer wants to buy something or place a new order, tell them to visit glczone.in, log in, and order there"
+            )
+        }
+    ]
+    for m in recent_msgs:
+        role = "user" if m.get("direction") == "IN" else "assistant"
+        messages.append({"role": role, "content": m.get("text", "")})
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                json={"model": "openai/gpt-oss-120b", "messages": [{"role": "system", "content": "GLC_PRICE_RULE: Product ka price hamesha EXACTLY wahi batao jo product list mein likha hai. Har price ke saath uska pack size zaroor batao (jaise Tomato 250g ₹10). Khud se calculate, per-kg convert ya andaza kabhi mat lagao. Agar price list mein nahi hai toh bolo: website ya app pe latest rate check karein."}] + messages, "max_tokens": 300, "temperature": 0.2}
+            )
+            data = resp.json()
+            ai_text = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.exception(f"Groq AI reply failed: {e}")
+        return
+
+    if not ai_text:
+        return
+
+    send_platform_message(channel, contact, ai_text)
+
+    # DB mein save karo
+    out_msg = {
+        "id": uid(),
+        "conversationId": conversation["id"],
+        "channel": channel,
+        "direction": "OUT",
+        "text": ai_text,
+        "sentBy": "AI Assistant",
+        "sentById": "ai",
+        "status": "SENT",
+        "createdAt": now_iso(),
+    }
+    await db.ocm_messages.insert_one(out_msg)
+    await db.ocm_conversations.update_one(
+        {"id": conversation["id"]},
+        {"$set": {"lastMessage": ai_text, "lastMessageAt": now_iso()}}
+    )
+
+async def run_matching_flows(contact: dict, conversation: dict, incoming_text: str, channel: str):
+    """Check active flows for a keyword match and auto-send their steps."""
+    flows = await db.ocm_flows.find({"channel": channel, "status": {"$in": ["ACTIVE", "PUBLISHED"]}}).to_list(100)
+    text_lower = (incoming_text or "").lower().strip()
+
+    for flow in flows:
+        trigger = flow.get("trigger", "KEYWORD")
+        trigger_value = (flow.get("triggerValue") or "").lower().strip()
+        matched = False
+        if trigger == "KEYWORD" and trigger_value:
+            import re as _re
+            clean_text = _re.sub(r"[^\w\s]", " ", text_lower)
+            words_in_text = set(clean_text.split())
+            keywords = [k.strip() for k in trigger_value.split(",") if k.strip()]
+            for kw in keywords:
+                kw_clean = _re.sub(r"[^\w\s]", " ", kw).strip()
+                if " " in kw_clean:
+                    if kw_clean in clean_text:
+                        matched = True
+                        break
+                elif kw_clean in words_in_text:
+                    matched = True
+                    break
+        elif trigger == "WELCOME":
+            existing_count = await db.ocm_messages.count_documents({"conversationId": conversation["id"]})
+            if existing_count <= 1:
+                matched = True
+
+        if not matched:
+            continue
+
+        for step in flow.get("steps", []):
+            step_text = step.get("text") or step.get("message")
+            if not step_text:
+                continue
+            send_platform_message(channel, contact, step_text)
+            out_msg = {
+                "id": uid(),
+                "conversationId": conversation["id"],
+                "channel": channel,
+                "direction": "OUT",
+                "text": step_text,
+                "sentBy": f"Bot: {flow.get('name', 'Flow')}",
+                "sentById": "system",
+                "status": "SENT",
+                "createdAt": now_iso(),
+            }
+            await db.ocm_messages.insert_one(out_msg)
+            await db.ocm_conversations.update_one({"id": conversation["id"]}, {"$set": {"lastMessage": step_text, "lastMessageAt": now_iso()}})
+        return True  # flow matched and ran
+    return False  # no flow matched
+
+
+@api.post("/ocm/message/incoming")
+async def ocm_message_incoming(request: Request):
+    body = await request.json()
+    sig = body.pop("sig", "")
+
+    if not CRM_SSO_SECRET:
+        raise HTTPException(500, "Not configured")
+    channel = body.get("channel") or "WHATSAPP"
+    payload_json = json.dumps({"from": body.get("from"), "name": body.get("name"), "text": body.get("text"), "channel": channel}, separators=(",", ":"))
+    expected_sig = hmac.new(CRM_SSO_SECRET.encode(), payload_json.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, sig):
+        raise HTTPException(401, "Invalid signature")
+
+    from_id = body.get("from")
+    name = body.get("name") or f"{channel.title()} User"
+    text = body.get("text") or ""
+    id_field = CHANNEL_CONTACT_FIELD.get(channel, "phone")
+
+    if not from_id:
+        raise HTTPException(400, "Missing sender id")
+
+    contact = await db.ocm_contacts.find_one({id_field: from_id})
+    if not contact:
+        contact = {
+            "id": uid(),
+            "name": name,
+            "phone": from_id if channel == "WHATSAPP" else None,
+            id_field: from_id,
+            "channels": [channel],
+            "tags": [],
+            "subscribed": True,
+            "createdAt": now_iso(),
+            "updatedAt": now_iso(),
+        }
+        await db.ocm_contacts.insert_one(dict(contact))
+    else:
+        # Update name if it was Unknown before
+        update_fields = {"updatedAt": now_iso()}
+        if name and name != "Unknown" and (not contact.get("name") or contact.get("name") in ["Unknown", "Telegram User", "Instagram User", "Facebook User", "WhatsApp User"]):
+            update_fields["name"] = name
+        if channel not in contact.get("channels", []):
+            await db.ocm_contacts.update_one({"id": contact["id"]}, {"$addToSet": {"channels": channel}, "$set": update_fields})
+        elif update_fields:
+            await db.ocm_contacts.update_one({"id": contact["id"]}, {"$set": update_fields})
+
+    conversation = await db.ocm_conversations.find_one({"contactId": contact["id"], "channel": channel})
+    if not conversation:
+        conversation = {
+            "id": uid(),
+            "contactId": contact["id"],
+            "channel": channel,
+            "status": "OPEN",
+            "lastMessage": text,
+            "lastMessageAt": now_iso(),
+            "createdAt": now_iso(),
+        }
+        await db.ocm_conversations.insert_one(dict(conversation))
+
+    in_msg = {
+        "id": uid(),
+        "conversationId": conversation["id"],
+        "channel": channel,
+        "direction": "IN",
+        "text": text,
+        "sentBy": name,
+        "sentById": contact["id"],
+        "status": "RECEIVED",
+        "createdAt": now_iso(),
+    }
+    await db.ocm_messages.insert_one(in_msg)
+    await db.ocm_conversations.update_one({"id": conversation["id"]}, {"$set": {"lastMessage": text, "lastMessageAt": now_iso(), "status": "OPEN"}})
+
+    flow_matched = await run_matching_flows(contact, conversation, text, channel)
+    if flow_matched:
+        return {"ok": True}
+
+    # Language preference check (only meaningful for AI-assisted channels)
+    contact_fresh = await db.ocm_contacts.find_one({"id": contact["id"]}, {"_id": 0})
+    preferred_lang = (contact_fresh or {}).get("preferredLang")
+
+    lang_map = {"1": "Hindi", "2": "English", "3": "Hinglish", "4": "Bengali"}
+    if not preferred_lang and text.strip() in lang_map:
+        chosen_lang = lang_map[text.strip()]
+        await db.ocm_contacts.update_one({"id": contact["id"]}, {"$set": {"preferredLang": chosen_lang}})
+        confirm = {"Hindi": "धन्यवाद! अब मैं हिंदी में बात करूँगा। क्या मदद चाहिए? 😊", "English": "Thank you! I will now reply in English. How can I help? 😊", "Hinglish": "Thanks! Ab Hinglish mein baat karenge. Kya help chahiye? 😊", "Bengali": "ধন্যবাদ! এখন বাংলায় কথা বলব। কী সাহায্য দরকার? 😊"}
+        msg = confirm[chosen_lang]
+        send_platform_message(channel, contact, msg)
+        out = {"id": uid(), "conversationId": conversation["id"], "channel": channel, "direction": "OUT", "text": msg, "sentBy": "AI Assistant", "sentById": "ai", "status": "SENT", "createdAt": now_iso()}
+        await db.ocm_messages.insert_one(out)
+        await db.ocm_conversations.update_one({"id": conversation["id"]}, {"$set": {"lastMessage": msg, "lastMessageAt": now_iso()}})
+        return {"ok": True}
+
+    if not preferred_lang:
+        lang_asked = (contact_fresh or {}).get("langAsked", False)
+        if not lang_asked:
+            await db.ocm_contacts.update_one({"id": contact["id"]}, {"$set": {"langAsked": True}})
+            lp = "\U0001f64f Welcome to GLC Zone!\n\nMain hoon Zara, aapki GLC Zone assistant! \U0001f31f\n\nPlease select your preferred language:\n1 Hindi\n2 English\n3 Hinglish\n4 Bengali\n\nReply with 1, 2, 3, or 4"
+            send_platform_message(channel, contact, lp)
+            out = {"id": uid(), "conversationId": conversation["id"], "channel": channel, "direction": "OUT", "text": lp, "sentBy": "AI Assistant", "sentById": "ai", "status": "SENT", "createdAt": now_iso()}
+            await db.ocm_messages.insert_one(out)
+            await db.ocm_conversations.update_one({"id": conversation["id"]}, {"$set": {"lastMessage": lp, "lastMessageAt": now_iso()}})
+            return {"ok": True}
+
+    conv_fresh = await db.ocm_conversations.find_one({"id": conversation["id"]}, {"_id": 0})
+    if (conv_fresh or {}).get("agentMode"):
+        log.info(f"AgentMode ON for conv {conversation['id']} — AI skipped")
+    else:
+        await run_ai_reply(contact, conversation, text, preferred_lang or "Hindi", channel)
+
+    return {"ok": True}
+
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+import io
+
+@api.get("/invoices/{iid}/pdf")
+async def download_invoice_pdf(iid: str, user=Depends(current_user)):
+    from fastapi.responses import StreamingResponse
+    d = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not d:
+        raise HTTPException(404, "Invoice not found")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=15*mm, leftMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
+    styles = getSampleStyleSheet()
+    bold = ParagraphStyle("bold", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=10)
+    normal = styles["Normal"]
+    normal.fontSize = 9
+    right = ParagraphStyle("right", parent=styles["Normal"], alignment=TA_RIGHT, fontSize=9)
+    center = ParagraphStyle("center", parent=styles["Normal"], alignment=TA_CENTER, fontSize=9)
+
+    elems = []
+
+    # Header
+    elems.append(Paragraph("GLC Zone Private Limited", ParagraphStyle("h1", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=16)))
+    elems.append(Paragraph("Kishanganj, Bihar | GSTIN: 10FZTPA0354J1ZJ | glczone.in", ParagraphStyle("sub", parent=styles["Normal"], fontSize=8, textColor=colors.grey)))
+    elems.append(Spacer(1, 6*mm))
+
+    # Invoice info table
+    inv_date = str(d.get("invoiceDate", ""))[:10]
+    due_date = str(d.get("dueDate", ""))[:10]
+    info_data = [
+        [Paragraph(f"<b>TAX INVOICE</b>", bold), "", Paragraph(f"Invoice No: <b>{d.get('invoiceNo','')}</b>", bold)],
+        ["", "", f"Date: {inv_date}"],
+        ["", "", f"Due Date: {due_date}"],
+    ]
+    info_table = Table(info_data, colWidths=[80*mm, 40*mm, 65*mm])
+    info_table.setStyle(TableStyle([
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("ALIGN", (2,0), (2,-1), "RIGHT"),
+    ]))
+    elems.append(info_table)
+    elems.append(Spacer(1, 4*mm))
+
+    # Bill to
+    elems.append(Paragraph(f"<b>Bill To:</b> {d.get('customerName','')} | GST: {d.get('customerGst','-')} | State: {d.get('customerState','-')}", bold))
+    elems.append(Spacer(1, 4*mm))
+
+    # Items table
+    headers = ["#", "Item", "HSN", "Qty", "Rate (₹)", "GST%", "Amount (₹)"]
+    rows = [headers]
+    for i, item in enumerate(d.get("items", []), 1):
+        qty = item.get("qty", 0)
+        rate = item.get("rate", 0)
+        gst = item.get("gstRate", 0)
+        amount = qty * rate * (1 + gst/100)
+        rows.append([
+            str(i),
+            item.get("name", ""),
+            item.get("hsn", ""),
+            str(qty),
+            f"{rate:,.2f}",
+            f"{gst}%",
+            f"{amount:,.2f}",
+        ])
+
+    item_table = Table(rows, colWidths=[8*mm, 65*mm, 18*mm, 12*mm, 22*mm, 14*mm, 26*mm])
+    item_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#064E3B")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F0FDF4")]),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#D1FAE5")),
+        ("ALIGN", (3,0), (-1,-1), "RIGHT"),
+        ("TOPPADDING", (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+    ]))
+    elems.append(item_table)
+    elems.append(Spacer(1, 4*mm))
+
+    # Totals
+    status = d.get("status", "")
+    status_color = colors.green if status == "PAID" else colors.orange if status == "PARTIAL" else colors.red
+    totals = [
+        ["", "Subtotal:", f"₹{d.get('subtotal',0):,.2f}"],
+        ["", "CGST:", f"₹{d.get('cgst',0):,.2f}"],
+        ["", "SGST:", f"₹{d.get('sgst',0):,.2f}"],
+        ["", "IGST:", f"₹{d.get('igst',0):,.2f}"],
+        ["", Paragraph("<b>Total:</b>", bold), Paragraph(f"<b>₹{d.get('total',0):,.2f}</b>", bold)],
+        ["", "Paid:", f"₹{d.get('paidAmount',0):,.2f}"],
+        ["", Paragraph("<b>Due:</b>", bold), Paragraph(f"<b>₹{d.get('dueAmount',0):,.2f}</b>", bold)],
+    ]
+    tot_table = Table(totals, colWidths=[100*mm, 40*mm, 45*mm])
+    tot_table.setStyle(TableStyle([
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("ALIGN", (1,0), (-1,-1), "RIGHT"),
+        ("LINEABOVE", (1,4), (-1,4), 0.5, colors.grey),
+        ("LINEBELOW", (1,6), (-1,6), 0.5, colors.grey),
+    ]))
+    elems.append(tot_table)
+    elems.append(Spacer(1, 6*mm))
+
+    # Footer
+    elems.append(Paragraph(f"Status: <b>{status}</b> | Vertical: {d.get('vertical','')} | Thank you for your business!", normal))
+    elems.append(Spacer(1, 4*mm))
+    elems.append(Paragraph("This is a computer generated invoice.", ParagraphStyle("foot", parent=styles["Normal"], fontSize=7, textColor=colors.grey, alignment=TA_CENTER)))
+
+    doc.build(elems)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={d.get('invoiceNo','invoice')}.pdf"})
+
+
+@api.get("/search")
+async def global_search(q: str = "", user=Depends(current_user)):
+    if not q or len(q) < 2:
+        return {"results": []}
+    
+    pattern = {"$regex": q, "$options": "i"}
+    results = []
+
+    # Leads
+    leads = await db.leads.find(
+        {"$or": [{"name": pattern}, {"email": pattern}, {"phone": pattern}, {"company": pattern}]},
+        {"_id": 0, "id": 1, "name": 1, "email": 1, "status": 1}
+    ).limit(4).to_list(4)
+    for l in leads:
+        results.append({"type": "Lead", "id": l["id"], "title": l.get("name",""), "subtitle": l.get("email",""), "url": "/crm/leads", "status": l.get("status","")})
+
+    # Customers
+    custs = await db.customers.find(
+        {"$or": [{"name": pattern}, {"email": pattern}, {"phone": pattern}]},
+        {"_id": 0, "id": 1, "name": 1, "email": 1, "phone": 1}
+    ).limit(4).to_list(4)
+    for c in custs:
+        results.append({"type": "Customer", "id": c["id"], "title": c.get("name",""), "subtitle": c.get("phone",""), "url": "/crm/customers"})
+
+    # Invoices
+    invs = await db.invoices.find(
+        {"$or": [{"invoiceNo": pattern}, {"customerName": pattern}]},
+        {"_id": 0, "id": 1, "invoiceNo": 1, "customerName": 1, "total": 1, "status": 1}
+    ).limit(4).to_list(4)
+    for i in invs:
+        results.append({"type": "Invoice", "id": i["id"], "title": i.get("invoiceNo",""), "subtitle": i.get("customerName",""), "url": "/sales/invoices", "status": i.get("status","")})
+
+    # Products
+    prods = await db.products.find(
+        {"$or": [{"name": pattern}, {"sku": pattern}]},
+        {"_id": 0, "id": 1, "name": 1, "sku": 1, "price": 1}
+    ).limit(3).to_list(3)
+    for p in prods:
+        results.append({"type": "Product", "id": p["id"], "title": p.get("name",""), "subtitle": f"SKU: {p.get('sku','')}", "url": "/inventory/products"})
+
+    # Employees
+    emps = await db.employees.find(
+        {"$or": [{"name": pattern}, {"email": pattern}, {"employeeCode": pattern}]},
+        {"_id": 0, "id": 1, "name": 1, "role": 1, "employeeCode": 1}
+    ).limit(3).to_list(3)
+    for e in emps:
+        results.append({"type": "Employee", "id": e["id"], "title": e.get("name",""), "subtitle": e.get("role",""), "url": "/hr/employees"})
+
+    return {"results": results[:12]}
+
+
+import pyotp
+import qrcode
+import qrcode.image.svg
+
+@api.get("/auth/2fa/setup")
+async def setup_2fa(user=Depends(current_user)):
+    """Generate TOTP secret and QR code for user."""
+    secret = pyotp.random_base32()
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=user["email"], issuer_name="GLC Zone CRM")
+    
+    # QR code as base64 image
+    import io, base64
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_b64 = base64.b64encode(buf.getvalue()).decode()
+    
+    # Save secret temporarily (not enabled yet)
+    await db.users.update_one({"id": user["id"]}, {"$set": {"totp_secret_pending": secret}})
+    
+    return {"secret": secret, "qr": f"data:image/png;base64,{qr_b64}", "uri": uri}
+
+@api.post("/auth/2fa/enable")
+async def enable_2fa(body: Dict[str, Any], user=Depends(current_user)):
+    """Verify OTP and enable 2FA."""
+    code = str(body.get("code", ""))
+    u = await db.users.find_one({"id": user["id"]}, {"_id": 0})
+    secret = u.get("totp_secret_pending")
+    if not secret:
+        raise HTTPException(400, "Setup 2FA first")
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code, valid_window=1):
+        raise HTTPException(400, "Invalid OTP code")
+    await db.users.update_one({"id": user["id"]}, {
+        "$set": {"totp_secret": secret, "twofa_enabled": True},
+        "$unset": {"totp_secret_pending": ""}
+    })
+    return {"ok": True, "message": "2FA enabled successfully"}
+
+@api.post("/auth/2fa/disable")
+async def disable_2fa(body: Dict[str, Any], user=Depends(current_user)):
+    """Disable 2FA after verifying OTP."""
+    code = str(body.get("code", ""))
+    u = await db.users.find_one({"id": user["id"]}, {"_id": 0})
+    secret = u.get("totp_secret")
+    if not secret:
+        raise HTTPException(400, "2FA not enabled")
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code, valid_window=1):
+        raise HTTPException(400, "Invalid OTP code")
+    await db.users.update_one({"id": user["id"]}, {
+        "$unset": {"totp_secret": "", "twofa_enabled": ""}
+    })
+    return {"ok": True, "message": "2FA disabled"}
+
+@api.post("/auth/2fa/verify")
+async def verify_2fa(body: Dict[str, Any]):
+    """Verify OTP during login (no auth required)."""
+    token = body.get("temp_token", "")
+    code = str(body.get("code", ""))
+    if not token or not code:
+        raise HTTPException(400, "Missing fields")
+    
+    # Decode temp token to get user
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        uid_ = payload.get("sub")
+    except Exception:
+        raise HTTPException(401, "Invalid token")
+    
+    u = await db.users.find_one({"id": uid_}, {"_id": 0})
+    if not u:
+        raise HTTPException(404, "User not found")
+    
+    secret = u.get("totp_secret")
+    if not secret:
+        raise HTTPException(400, "2FA not configured")
+    
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code, valid_window=1):
+        raise HTTPException(400, "Invalid OTP")
+    
+    # Issue full token
+    full_token = make_token(u["id"], u.get("email",""), u.get("role",""))
+    return {"token": full_token, "user": {k: u[k] for k in ["id","name","email","role","employeeCode"] if k in u}}
+
+
+import shutil
+from fastapi import UploadFile, File
+from fastapi.responses import FileResponse
+import uuid as uuid_lib
+
+UPLOAD_DIR = "/var/www/crm-glc-source/backend/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@api.post("/upload")
+async def upload_file(file: UploadFile = File(...), user=Depends(current_user)):
+    ext = os.path.splitext(file.filename)[1].lower()
+    allowed = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".zip"}
+    if ext not in allowed:
+        raise HTTPException(400, f"File type {ext} not allowed")
+    if file.size and file.size > 10 * 1024 * 1024:  # 10MB
+        raise HTTPException(400, "File too large (max 10MB)")
+    
+    file_id = str(uuid_lib.uuid4())
+    filename = f"{file_id}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    
+    with open(filepath, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    
+    return {
+        "id": file_id,
+        "filename": file.filename,
+        "stored_name": filename,
+        "url": f"/api/files/{filename}",
+        "size": os.path.getsize(filepath),
+        "type": file.content_type,
+    }
+
+@api.get("/files/{filename}")
+async def get_file(filename: str, user=Depends(current_user)):
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(404, "File not found")
+    return FileResponse(filepath)
+
+
+# ── GLC Zone Sync Endpoints ──────────────────────────────────────
+@api.post("/sync/deals")
+async def sync_glczone_deals_endpoint(user=Depends(current_user)):
+    """Sync GlcZone orders → CRM Pipeline deals"""
+    import aiomysql
+    conn = await aiomysql.connect(host="127.0.0.1", port=3306, user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""), db="glczone_db", autocommit=True)
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            SELECT o.id, o.mobile, o.total, o.payment_method, o.payment_status, o.created_at,
+                   u.username, u.email,
+                   GROUP_CONCAT(oi.product_name SEPARATOR ', ') as product_names
+            FROM orders o
+            LEFT JOIN users u ON u.mobile = o.mobile
+            LEFT JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY o.id
+            ORDER BY o.created_at DESC
+            LIMIT 500
+        """)
+        rows = await cur.fetchall()
+    conn.close()
+
+    created = updated = 0
+    for row in rows:
+        oid, mobile, total, payment, pay_status, created_at, username, email, product_names = row
+        existing = await db.deals.find_one({"glczone_order_id": str(oid)}, {"_id": 0})
+        stage = "WON" if str(pay_status or "").lower() == "paid" else "NEW"
+        prob = 100 if stage == "WON" else 50
+        data = {
+            "glczone_order_id": str(oid),
+            "title": f"Order #{oid} — {username or mobile}",
+            "customerName": username or mobile,
+            "customerPhone": mobile or "",
+            "customerEmail": email or "",
+            "value": float(total or 0),
+            "stage": existing.get("stage", stage) if existing else stage,
+            "probability": existing.get("probability", prob) if existing else prob,
+            "paymentMethod": payment or "COD",
+            "paymentStatus": str(pay_status or "pending").lower(),
+            "notes": str(product_names or ""),
+            "source": "glczone.in",
+            "vertical": "GLC Zone",
+            "updatedAt": now_iso(),
+        }
+        if existing:
+            data["stage"] = existing.get("stage", stage)
+            await db.deals.update_one({"glczone_order_id": str(oid)}, {"$set": data})
+            updated += 1
+        else:
+            data.update({"id": uid(), "createdAt": str(created_at)})
+            await db.deals.insert_one(data)
+            created += 1
+    return {"ok": True, "created": created, "updated": updated, "total": len(rows)}
+
+
+@api.post("/sync/orders")
+async def sync_glczone_orders(user=Depends(current_user)):
+    """Sync glczone.in orders → CRM deals"""
+    # Permission check
+    role = user.get("role", "")
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    perms = perms_map.get(role, ROLE_PERMS.get(role, []))
+    has_access = "*" in perms or any(p in perms for p in ["sales", "crm", "sales.orders"])
+    if not has_access:
+        raise HTTPException(403, "Access denied: insufficient permissions")
+    import aiomysql, json as _json
+    conn = await aiomysql.connect(
+        host="127.0.0.1", port=3306,
+        user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""),
+        db="glczone_db", autocommit=True
+    )
+    created = updated = 0
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            SELECT o.id, o.mobile, o.total, o.payment_method, o.payment_status,
+                   o.created_at, u.username, u.email, oi.status as item_status
+            FROM orders o
+            LEFT JOIN users u ON u.mobile = o.mobile
+            LEFT JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY o.id
+            ORDER BY o.created_at DESC
+            LIMIT 500
+        """)
+        rows = await cur.fetchall()
+    conn.close()
+
+    for row in rows:
+        oid, mobile, total, payment, pay_status, created_at, username, email, status_json = row
+        # Status parse karo
+        try:
+            status_list = _json.loads(status_json or "[]")
+            current_status = status_list[-1][0] if status_list else "received"
+        except Exception:
+            current_status = "received"
+
+        # CRM stage mapping
+        stage_map = {
+            "received": "NEW",
+            "processing": "PROPOSAL",
+            "shipped": "NEGOTIATION",
+            "delivered": "WON",
+            "cancelled": "LOST",
+        }
+        stage = stage_map.get(current_status, "NEW")
+
+        # Check if deal already exists
+        existing = await db.deals.find_one({"glczone_order_id": str(oid)}, {"_id": 0})
+        deal_data = {
+            "glczone_order_id": str(oid),
+            "title": f"Order #{oid} — {username or mobile}",
+            "customerName": username or mobile,
+            "customerPhone": mobile,
+            "customerEmail": email or "",
+            "value": float(total or 0),
+            "stage": stage,
+            "paymentMethod": payment or "COD",
+            "paymentStatus": pay_status or "PENDING",
+            "glczone_status": current_status,
+            "vertical": "GLC Zone",
+            "source": "glczone.in",
+            "updatedAt": now_iso(),
+        }
+        if existing:
+            await db.deals.update_one({"glczone_order_id": str(oid)}, {"$set": deal_data})
+            updated += 1
+        else:
+            deal_data.update({
+                "id": uid(),
+                "probability": 100 if stage == "WON" else 50,
+                "createdAt": str(created_at),
+            })
+            await db.deals.insert_one(deal_data)
+            created += 1
+
+    return {"ok": True, "created": created, "updated": updated, "total": len(rows)}
+
+
+@api.post("/sync/customers")
+async def sync_glczone_customers(user=Depends(current_user)):
+    """Sync glczone.in users → CRM customers"""
+    # Permission check
+    role = user.get("role", "")
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    perms = perms_map.get(role, ROLE_PERMS.get(role, []))
+    has_access = "*" in perms or any(p in perms for p in ["crm", "crm.customers"])
+    if not has_access:
+        raise HTTPException(403, "Access denied: insufficient permissions")
+    import aiomysql
+    conn = await aiomysql.connect(
+        host="127.0.0.1", port=3306,
+        user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""),
+        db="glczone_db", autocommit=True
+    )
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            SELECT u.id, u.username, u.email, u.mobile, u.created_at,
+                   COUNT(o.id) as order_count,
+                   COALESCE(SUM(o.total), 0) as total_spent
+            FROM users u
+            LEFT JOIN orders o ON o.mobile = u.mobile
+            WHERE u.type = 'phone' AND u.username IS NOT NULL
+            GROUP BY u.id
+            ORDER BY total_spent DESC
+            LIMIT 500
+        """)
+        rows = await cur.fetchall()
+    conn.close()
+
+    created = updated = 0
+    for row in rows:
+        uid_, username, email, mobile, created_at, order_count, total_spent = row
+        existing = await db.customers.find_one({"glczone_user_id": str(uid_)}, {"_id": 0})
+        cdata = {
+            "glczone_user_id": str(uid_),
+            "name": username or f"User {mobile}",
+            "email": email or "",
+            "phone": mobile or "",
+            "type": "RETAIL",
+            "source": "glczone.in",
+            "glczone_orders": int(order_count),
+            "glczone_spent": float(total_spent),
+            "updatedAt": now_iso(),
+        }
+        if existing:
+            await db.customers.update_one({"glczone_user_id": str(uid_)}, {"$set": cdata})
+            updated += 1
+        else:
+            cdata.update({
+                "id": uid(),
+                "creditLimit": 0,
+                "vertical": "GLC Zone",
+                "createdAt": str(created_at),
+            })
+            await db.customers.insert_one(cdata)
+            created += 1
+
+    return {"ok": True, "created": created, "updated": updated, "total": len(rows)}
+
+
+@api.get("/sync/status")
+async def sync_status(user=Depends(current_user)):
+    """Sync status — kitne records synced hain"""
+    import aiomysql
+    conn = await aiomysql.connect(
+        host="127.0.0.1", port=3306,
+        user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""),
+        db="glczone_db", autocommit=True
+    )
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT COUNT(*) FROM orders")
+        total_orders = (await cur.fetchone())[0]
+        await cur.execute("SELECT COUNT(*) FROM users WHERE type='phone'")
+        total_users = (await cur.fetchone())[0]
+    conn.close()
+
+    synced_deals = await db.deals.count_documents({"source": "glczone.in"})
+    synced_customers = await db.customers.count_documents({"source": "glczone.in"})
+
+    return {
+        "glczone": {"orders": total_orders, "customers": total_users},
+        "crm": {"deals": synced_deals, "customers": synced_customers},
+        "last_sync": now_iso(),
+    }
+
+
+@api.post("/sync/products")
+async def sync_glczone_products(user=Depends(current_user)):
+    """Sync glczone.in products → CRM inventory"""
+    role = user.get("role", "")
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    perms = perms_map.get(role, ROLE_PERMS.get(role, []))
+    if "*" not in perms and not any(p in perms for p in ["inventory", "inventory.products"]):
+        raise HTTPException(403, "Access denied")
+
+    import aiomysql
+    conn = await aiomysql.connect(host="127.0.0.1", port=3306, user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""), db="glczone_db", autocommit=True)
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            SELECT p.id, p.name, p.sku, (SELECT CASE WHEN pv.special_price > 0 AND pv.special_price < pv.price THEN pv.special_price ELSE pv.price END FROM product_variants pv WHERE pv.product_id = p.id ORDER BY pv.price LIMIT 1) AS sale_price /* GLC_VARIANT_PRICE */, p.vendor_price, p.stock, p.status,
+                   c.name as category_name
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.status = 1
+            LIMIT 500
+        """)
+        rows = await cur.fetchall()
+    conn.close()
+
+    created = updated = 0
+    for row in rows:
+        pid, name, sku, sale_price, vendor_price, stock, status, category = row
+        # Parse JSON name: {"en":"Potato"} → "Potato"
+        try:
+            name_parsed = json.loads(name or "{}")
+            clean_name = name_parsed.get("en") or name_parsed.get("hi") or str(name or "")
+        except:
+            clean_name = str(name or "")
+        # Parse category name same way
+        try:
+            cat_parsed = json.loads(category or "{}")
+            clean_cat = cat_parsed.get("en") or cat_parsed.get("hi") or str(category or "General")
+        except:
+            clean_cat = str(category or "General")
+        existing = await db.products.find_one({"glczone_id": str(pid)}, {"_id": 0})
+        data = {
+            "glczone_id": str(pid),
+            "name": clean_name,
+            "sku": sku or f"GLC-{pid}",
+            "sellingPrice": float(sale_price or 0),
+            "buyingPrice": float(vendor_price or 0),
+            "mrp": float(sale_price or 0),
+            "stock": int(stock or 0),
+            "category": clean_cat,
+            "source": "glczone.in",
+            "vertical": "GLC Zone",
+            "updatedAt": now_iso(),
+        }
+        if existing:
+            await db.products.update_one({"glczone_id": str(pid)}, {"$set": data})
+            updated += 1
+        else:
+            data.update({"id": uid(), "createdAt": now_iso()})
+            await db.products.insert_one(data)
+            created += 1
+
+    return {"ok": True, "created": created, "updated": updated, "total": len(rows)}
+
+
+@api.post("/sync/orders-crm")
+async def sync_glczone_orders_crm(user=Depends(current_user)):
+    """Sync glczone.in orders → CRM Sales Orders"""
+    role = user.get("role", "")
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    perms = perms_map.get(role, ROLE_PERMS.get(role, []))
+    if "*" not in perms and not any(p in perms for p in ["sales", "sales.orders"]):
+        raise HTTPException(403, "Access denied")
+
+    import aiomysql, json as _json
+    conn = await aiomysql.connect(host="127.0.0.1", port=3306, user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""), db="glczone_db", autocommit=True)
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            SELECT o.id, o.mobile, o.total, o.final_total, o.payment_method,
+                   o.payment_status, o.address, o.created_at,
+                   u.username, oi.status as item_status,
+                   GROUP_CONCAT(oi.product_name SEPARATOR ', ') as product_names
+            FROM orders o
+            LEFT JOIN users u ON u.mobile = o.mobile
+            LEFT JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY o.id
+            ORDER BY o.created_at DESC
+            LIMIT 500
+        """)
+        rows = await cur.fetchall()
+    conn.close()
+
+    created = updated = 0
+    for row in rows:
+        oid, mobile, total, final_total, payment, pay_status, address, created_at, username, status_json, product_names = row
+        try:
+            status_list = _json.loads(status_json or "[]")
+            current_status = status_list[-1][0] if status_list else "received"
+        except:
+            current_status = "received"
+
+        status_map = {"received": "PENDING", "processing": "PROCESSING", "shipped": "SHIPPED", "delivered": "DELIVERED", "cancelled": "CANCELLED"}
+        crm_status = status_map.get(current_status, "PENDING")
+
+        existing = await db.sales_orders.find_one({"glczone_order_id": str(oid)}, {"_id": 0})
+        data = {
+            "glczone_order_id": str(oid),
+            "orderNo": f"GLZ-{oid}",
+            "customerName": username or mobile,
+            "customerPhone": mobile,
+            "total": float(total or 0),
+            "finalTotal": float(final_total or 0),
+            "paymentMethod": payment or "COD",
+            "paymentStatus": pay_status or "PENDING",
+            "status": crm_status,
+            "glczone_status": current_status,
+            "products": str(product_names or ""),
+            "deliveryAddress": str(address or ""),
+            "source": "glczone.in",
+            "vertical": "GLC Zone",
+            "updatedAt": now_iso(),
+        }
+        if existing:
+            await db.sales_orders.update_one({"glczone_order_id": str(oid)}, {"$set": data})
+            updated += 1
+        else:
+            data.update({"id": uid(), "createdAt": str(created_at)})
+            await db.sales_orders.insert_one(data)
+            created += 1
+
+    return {"ok": True, "created": created, "updated": updated, "total": len(rows)}
+
+
+@api.post("/sync/deliveries")
+async def sync_glczone_deliveries(user=Depends(current_user)):
+    """Sync glczone.in delivery orders → CRM deliveries"""
+    role = user.get("role", "")
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    perms = perms_map.get(role, ROLE_PERMS.get(role, []))
+    if "*" not in perms and "delivery" not in perms:
+        raise HTTPException(403, "Access denied")
+
+    import aiomysql, json as _json
+    conn = await aiomysql.connect(host="127.0.0.1", port=3306, user="glczone", password=__import__("os").getenv("GLCZONE_DB_PASSWORD", ""), db="glczone_db", autocommit=True)
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            SELECT o.id, o.mobile, o.address, o.created_at,
+                   u.username, oi.status, oi.delivery_boy_id,
+                   db_user.username as delivery_boy_name
+            FROM orders o
+            LEFT JOIN users u ON u.mobile = o.mobile
+            LEFT JOIN order_items oi ON oi.order_id = o.id
+            LEFT JOIN users db_user ON db_user.id = oi.delivery_boy_id
+            GROUP BY o.id
+            ORDER BY o.created_at DESC
+            LIMIT 500
+        """)
+        rows = await cur.fetchall()
+    conn.close()
+
+    created = updated = 0
+    for row in rows:
+        oid, mobile, address, created_at, username, status_json, db_id, db_name = row
+        try:
+            status_list = _json.loads(status_json or "[]")
+            current_status = status_list[-1][0] if status_list else "received"
+        except:
+            current_status = "received"
+
+        existing = await db.deliveries.find_one({"glczone_order_id": str(oid)}, {"_id": 0})
+        data = {
+            "glczone_order_id": str(oid),
+            "orderNo": f"GLZ-{oid}",
+            "customerName": username or mobile,
+            "customerPhone": mobile,
+            "deliveryAddress": str(address or ""),
+            "deliveryBoy": db_name or "Unassigned",
+            "status": {"RECEIVED": "PENDING", "PROCESSED": "PENDING", "PROCESSING": "PENDING", "SHIPPED": "IN_TRANSIT", "OUT_FOR_DELIVERY": "IN_TRANSIT"}.get(str(current_status).upper(), str(current_status).upper()),
+            "source": "glczone.in",
+            "updatedAt": now_iso(),
+        }
+        if existing:
+            await db.deliveries.update_one({"glczone_order_id": str(oid)}, {"$set": data})
+            updated += 1
+        else:
+            data.update({"id": uid(), "createdAt": str(created_at)})
+            await db.deliveries.insert_one(data)
+            created += 1
+
+    return {"ok": True, "created": created, "updated": updated, "total": len(rows)}
+
+
+@api.get("/sync/all")
+async def sync_all(user=Depends(current_user)):
+    """Sync status of all modules"""
+    orders_count = await db.sales_orders.count_documents({"source": "glczone.in"})
+    products_count = await db.products.count_documents({"source": "glczone.in"})
+    customers_count = await db.customers.count_documents({"source": "glczone.in"})
+    deals_count = await db.deals.count_documents({"source": "glczone.in"})
+    deliveries_count = await db.deliveries.count_documents({"source": "glczone.in"})
+    return {
+        "synced": {
+            "orders": orders_count,
+            "products": products_count,
+            "customers": customers_count,
+            "deals": deals_count,
+            "deliveries": deliveries_count,
+        }
+    }
+
+
+@api.post("/ocm/webchat")
+async def webchat_incoming(request: Request):
+    """Website chat widget endpoint — no auth required."""
+    body = await request.json()
+    session_id = body.get("sessionId", "unknown")
+    text = body.get("text", "")
+    name = body.get("name", "Web Visitor")
+
+    if not text:
+        return {"ok": False, "error": "No text"}
+
+    # Find or create contact
+    contact = await db.ocm_contacts.find_one({"webchatId": session_id})
+    if not contact:
+        contact = {
+            "id": uid(),
+            "name": name,
+            "webchatId": session_id,
+            "channels": ["WEBCHAT"],
+            "tags": ["website"],
+            "subscribed": True,
+            "createdAt": now_iso(),
+            "updatedAt": now_iso(),
+        }
+        await db.ocm_contacts.insert_one(dict(contact))
+
+    # Find or create conversation
+    conversation = await db.ocm_conversations.find_one({"contactId": contact["id"], "channel": "WEBCHAT"})
+    if not conversation:
+        conversation = {
+            "id": uid(),
+            "contactId": contact["id"],
+            "channel": "WEBCHAT",
+            "status": "OPEN",
+            "lastMessage": text,
+            "lastMessageAt": now_iso(),
+            "createdAt": now_iso(),
+        }
+        await db.ocm_conversations.insert_one(dict(conversation))
+
+    # Save incoming message
+    in_msg = {
+        "id": uid(),
+        "conversationId": conversation["id"],
+        "channel": "WEBCHAT",
+        "direction": "IN",
+        "text": text,
+        "sentBy": name,
+        "sentById": contact["id"],
+        "status": "RECEIVED",
+        "createdAt": now_iso(),
+    }
+    await db.ocm_messages.insert_one(in_msg)
+    await db.ocm_conversations.update_one(
+        {"id": conversation["id"]},
+        {"$set": {"lastMessage": text, "lastMessageAt": now_iso(), "status": "OPEN"}}
+    )
+
+    # Get AI reply
+    glczone_context = await fetch_glczone_context()
+    contact_fresh = await db.ocm_contacts.find_one({"id": contact["id"]}, {"_id": 0})
+    preferred_lang = (contact_fresh or {}).get("preferredLang", "Hinglish")
+
+    import httpx, os
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    ai_reply = "Namaste! Kya madad kar sakti hoon? 😊"
+
+    if groq_key:
+        recent_msgs = await db.ocm_messages.find(
+            {"conversationId": conversation["id"]}, {"_id": 0}
+        ).sort("createdAt", -1).limit(6).to_list(6)
+        recent_msgs.reverse()
+
+        messages = [{
+            "role": "system",
+            "content": (
+                f"You are Zara, a friendly AI assistant for GLC Zone (glczone.in). "
+                f"Reply in {preferred_lang}. Keep replies under 3 lines. Be helpful and warm."
+                f"\n{glczone_context}"
+                "\n- Delivery: ₹20 flat upto 15kg, ₹2/kg above"
+                "\n- Time: 30-60 min delivery"
+                "\n- Payment: COD/UPI/Card/Wallet"
+            )
+        }]
+        for m in recent_msgs:
+            role = "user" if m.get("direction") == "IN" else "assistant"
+            messages.append({"role": role, "content": m.get("text", "")})
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                    json={"model": "openai/gpt-oss-120b", "messages": messages, "max_tokens": 200}
+                )
+                ai_reply = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.exception(f"Webchat AI failed: {e}")
+
+    # Save AI reply
+    out_msg = {
+        "id": uid(),
+        "conversationId": conversation["id"],
+        "channel": "WEBCHAT",
+        "direction": "OUT",
+        "text": ai_reply,
+        "sentBy": "Zara AI",
+        "sentById": "ai",
+        "status": "SENT",
+        "createdAt": now_iso(),
+    }
+    await db.ocm_messages.insert_one(out_msg)
+    await db.ocm_conversations.update_one(
+        {"id": conversation["id"]},
+        {"$set": {"lastMessage": ai_reply, "lastMessageAt": now_iso()}}
+    )
+
+    return {"ok": True, "reply": ai_reply, "conversationId": conversation["id"]}
 
 
 class FlowIn(BaseModel):
@@ -1747,6 +4061,151 @@ class SocialPostIn(BaseModel):
     status: str = "SCHEDULED"
 
 
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")
+FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
+IG_BUSINESS_ACCOUNT_ID = os.environ.get("IG_BUSINESS_ACCOUNT_ID", "")
+FB_API_VERSION = "v20.0"
+
+
+def build_full_caption(caption: str, hashtags: List[str]) -> str:
+    tag_str = " ".join(h if h.startswith("#") else f"#{h}" for h in hashtags)
+    return f"{caption}\n\n{tag_str}".strip()
+
+
+def publish_to_facebook(full_caption: str, media_url: Optional[str]) -> dict:
+    if not FB_PAGE_ID or not FB_PAGE_ACCESS_TOKEN:
+        return {"success": False, "error": "Facebook Page not configured"}
+    try:
+        if media_url:
+            url = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/photos"
+            payload = {"url": media_url, "caption": full_caption, "access_token": FB_PAGE_ACCESS_TOKEN}
+        else:
+            url = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/feed"
+            payload = {"message": full_caption, "access_token": FB_PAGE_ACCESS_TOKEN}
+        r = requests.post(url, data=payload, timeout=30)
+        body = r.json()
+        if r.status_code == 200:
+            return {"success": True, "postId": body.get("id") or body.get("post_id")}
+        return {"success": False, "error": body.get("error", {}).get("message", "Unknown Facebook error")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def publish_to_instagram(full_caption: str, media_url: Optional[str]) -> dict:
+    if not IG_BUSINESS_ACCOUNT_ID or not FB_PAGE_ACCESS_TOKEN:
+        return {"success": False, "error": "Instagram Business Account not configured"}
+    if not media_url:
+        return {"success": False, "error": "Instagram requires an image/video URL — text-only posts are not supported"}
+    try:
+        create_url = f"https://graph.facebook.com/{FB_API_VERSION}/{IG_BUSINESS_ACCOUNT_ID}/media"
+        r1 = requests.post(create_url, data={
+            "image_url": media_url,
+            "caption": full_caption,
+            "access_token": FB_PAGE_ACCESS_TOKEN,
+        }, timeout=30)
+        body1 = r1.json()
+        if r1.status_code != 200 or "id" not in body1:
+            return {"success": False, "error": body1.get("error", {}).get("message", "Failed to create Instagram media container")}
+        creation_id = body1["id"]
+
+        publish_url = f"https://graph.facebook.com/{FB_API_VERSION}/{IG_BUSINESS_ACCOUNT_ID}/media_publish"
+        r2 = requests.post(publish_url, data={
+            "creation_id": creation_id,
+            "access_token": FB_PAGE_ACCESS_TOKEN,
+        }, timeout=30)
+        body2 = r2.json()
+        if r2.status_code == 200:
+            return {"success": True, "postId": body2.get("id")}
+        return {"success": False, "error": body2.get("error", {}).get("message", "Failed to publish Instagram media")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def broadcast_whatsapp(text: str) -> dict:
+    """Send WhatsApp message to all active conversations in 24hr window."""
+    try:
+        conversations = await db.ocm_conversations.find(
+            {"channel": "WHATSAPP", "status": "OPEN"},
+            {"_id": 0, "contactId": 1}
+        ).to_list(500)
+        
+        sent = 0
+        failed = 0
+        for conv in conversations:
+            contact = await db.ocm_contacts.find_one({"id": conv["contactId"]}, {"_id": 0})
+            if contact:
+                to_phone = contact.get("whatsappId") or contact.get("phone")
+                if to_phone:
+                    result = send_whatsapp_text(to_phone, text)
+                    if result.get("success"):
+                        sent += 1
+                    else:
+                        failed += 1
+        
+        return {"success": sent > 0, "sent": sent, "failed": failed, 
+                "error": None if sent > 0 else "No active WhatsApp conversations"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def publish_to_telegram(full_caption: str, media_url: Optional[str]) -> dict:
+    """Publish a post to Telegram channel."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    channel_id = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+    if not token or not channel_id:
+        return {"success": False, "error": "Telegram not configured"}
+    try:
+        if media_url:
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            payload = {"chat_id": channel_id, "photo": media_url, "caption": full_caption, "parse_mode": "Markdown"}
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {"chat_id": channel_id, "text": full_caption, "parse_mode": "Markdown"}
+        r = requests.post(url, json=payload, timeout=15)
+        body = r.json()
+        if body.get("ok"):
+            return {"success": True, "postId": str(body["result"]["message_id"])}
+        return {"success": False, "error": body.get("description", "Telegram error")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def publish_social_post(post: dict) -> dict:
+    full_caption = build_full_caption(post.get("caption", ""), post.get("hashtags", []))
+    media_url = post.get("mediaUrl")
+    results = {}
+    any_success = False
+    errors = []
+
+    for channel in post.get("channels", []):
+        if channel == "FACEBOOK":
+            res = publish_to_facebook(full_caption, media_url)
+        elif channel == "INSTAGRAM":
+            res = publish_to_instagram(full_caption, media_url)
+        elif channel == "TELEGRAM":
+            res = publish_to_telegram(full_caption, media_url)
+        elif channel == "WHATSAPP":
+            # WhatsApp broadcast to all active conversations (24hr window)
+            res = await broadcast_whatsapp(full_caption)
+        else:
+            res = {"success": False, "error": f"Publishing to {channel} not supported yet"}
+        results[channel] = res
+        if res.get("success"):
+            any_success = True
+        else:
+            errors.append(f"{channel}: {res.get('error')}")
+
+    new_status = "PUBLISHED" if any_success and not errors else ("PARTIALLY_PUBLISHED" if any_success else "FAILED")
+    update = {
+        "status": new_status,
+        "publishResults": results,
+        "publishedAt": now_iso() if any_success else None,
+        "publishError": "; ".join(errors) if errors else None,
+    }
+    await db.social_posts.update_one({"id": post["id"]}, {"$set": update})
+    return {**post, **update}
+
+
 @api.get("/ocm/social-posts")
 async def ocm_list_posts(user=Depends(current_user)):
     items = await db.social_posts.find({}, {"_id": 0}).sort("scheduledAt", -1).to_list(500)
@@ -1758,6 +4217,16 @@ async def ocm_create_post(data: SocialPostIn, user=Depends(current_user)):
     doc = {**data.model_dump(), "id": uid(), "createdBy": user["name"], "createdAt": now_iso()}
     await db.social_posts.insert_one(doc)
     return clean(doc)
+
+
+@api.post("/ocm/social-posts/{pid}/publish")
+async def ocm_publish_post_now(pid: str, user=Depends(current_user)):
+    post = await db.social_posts.find_one({"id": pid}, {"_id": 0})
+    if not post:
+        raise HTTPException(404, "Post not found")
+    result = await publish_social_post(post)
+    await log_activity(user["id"], "ocm.social-posts", "publish", pid, {"channels": post.get("channels")})
+    return clean(result)
 
 
 @api.put("/ocm/social-posts/{pid}")
@@ -1828,11 +4297,30 @@ async def ocm_stats(user=Depends(current_user)):
 # =========================================================
 # Seed on startup
 # =========================================================
+async def scheduled_posts_worker():
+    while True:
+        try:
+            now = now_iso()
+            due_posts = await db.social_posts.find({
+                "status": "SCHEDULED",
+                "scheduledAt": {"$ne": None, "$lte": now},
+            }, {"_id": 0}).to_list(50)
+            for post in due_posts:
+                try:
+                    await publish_social_post(post)
+                    log.info(f"Scheduled post auto-published: {post['id']}")
+                except Exception as e:
+                    log.exception(f"Scheduled post publish failed: {post.get('id')}: {e}")
+        except Exception as e:
+            log.exception(f"scheduled_posts_worker loop error: {e}")
+        await asyncio.sleep(60)
+
+
 @app.on_event("startup")
 async def startup_seed():
     from seed import seed_all
     try:
-        await seed_all(db)
+        pass  # seed_all disabled permanently - live production CRM, no auto demo-seed
         log.info("Seed complete")
     except Exception as e:
         log.exception(f"Seed failed: {e}")
@@ -1841,6 +4329,8 @@ async def startup_seed():
         log.info("Storage initialized")
     except Exception as e:
         log.warning(f"Storage init deferred: {e}")
+    asyncio.create_task(scheduled_posts_worker())
+    log.info("Scheduled posts worker started")
 
 
 @app.on_event("shutdown")

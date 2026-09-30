@@ -12,7 +12,8 @@ export default function Employees() {
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ name: "", email: "", phone: "", department: "", designation: "", salary: 0 });
+  const [form, setForm] = useState({ name: "", email: "", phone: "", department: "", designation: "", salary: 0, joinDate: "", status: "ACTIVE" });
+  const DEPTS = ["Management","Sales","Operations","Delivery","Accounts","HR","IT","Marketing","Procurement","Customer Support"];
 
   const load = () => { setLoading(true); api.get("/employees", { params: q ? { q } : {} }).then((r) => setRows(r.data.items || [])).finally(() => setLoading(false)); };
   useEffect(load, [q]);
@@ -57,7 +58,13 @@ export default function Employees() {
             <Field label="Name*" v={form.name} on={(v) => setForm({ ...form, name: v })} tid="emp-name" />
             <Field label="Email*" v={form.email} on={(v) => setForm({ ...form, email: v })} />
             <Field label="Phone" v={form.phone} on={(v) => setForm({ ...form, phone: v })} />
-            <Field label="Department" v={form.department} on={(v) => setForm({ ...form, department: v })} />
+            <div>
+              <label className="text-[11px] text-slate-500 mb-1 block">Department</label>
+              <select value={form.department} onChange={(e) => setForm({...form, department: e.target.value})} className="w-full h-9 px-2 rounded-lg border border-slate-200 text-[12.5px] bg-white">
+                <option value="">Select…</option>
+                {DEPTS.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
             <Field label="Designation" v={form.designation} on={(v) => setForm({ ...form, designation: v })} />
             <Field label="Salary ₹" v={form.salary} on={(v) => setForm({ ...form, salary: Number(v) })} type="number" />
           </div>
