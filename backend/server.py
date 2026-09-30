@@ -1016,6 +1016,10 @@ async def generate_invoice(oid: str, request: Request, user=Depends(current_user
     if not o:
         o = await db.sales_orders.find_one({"orderNo": str(oid)}, {"_id": 0})
     if not o:
+        # the website asks for "GLZ-<id>" but real-time webhook orders used to be stored as "#<id>": match on the website id
+        site_id = re.sub(r"^(GLZ-|#)", "", str(oid))
+        o = await db.sales_orders.find_one({"glczone_order_id": site_id}, {"_id": 0})
+    if not o:
         raise HTTPException(404, "Not found")
     oid = o["id"]  # ab CRM ka internal UUID use karo
     exists = await db.invoices.find_one({"orderId": oid}, {"_id": 0})
@@ -1849,7 +1853,7 @@ async def order_event_webhook(request: Request):
 
     data = {
         "glczone_order_id": order_id,
-        "orderNo": f"#{order_id}",
+        "orderNo": f"GLZ-{order_id}",
         "customerName": customer_name,
         "customerPhone": customer_phone,
         "customerEmail": customer_email,
