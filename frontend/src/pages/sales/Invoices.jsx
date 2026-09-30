@@ -6,6 +6,7 @@ import { PageHeader, DataGrid, EmptyState, StatusBadge } from "@/components/comm
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Field, SelectField } from "@/pages/crm/Leads";
 import { toast } from "sonner";
+import { useCompany } from "@/hooks/useCompany";
 
 const METHODS = ["CASH", "UPI", "CARD", "NEFT", "RTGS", "CHEQUE"];
 
@@ -18,6 +19,9 @@ export default function Invoices() {
   const [pay, setPay] = useState({ amount: 0, method: "UPI", reference: "" });
   const [viewOpen, setViewOpen] = useState(false);
   const [viewInv, setViewInv] = useState(null);
+  const [cnFor, setCnFor] = useState(null);
+  const [cnQty, setCnQty] = useState([]);
+  const [cnReason, setCnReason] = useState("Sales return");
 
   const load = () => {
     setLoading(true);
@@ -31,7 +35,29 @@ export default function Invoices() {
       await api.post("/payments", { invoiceId: payFor.id, amount: Number(pay.amount), method: pay.method, reference: pay.reference });
       toast.success("Payment recorded");
       setPayOpen(false); load();
-    } catch { toast.error("Failed"); }
+    } catch (e) { toast.error(e?.response?.data?.detail || "Failed"); }
+  };
+
+  const openCredit = (r) => {
+    const lines = r.lines?.length ? r.lines : (r.items || []);
+    setCnFor({ ...r, _lines: lines });
+    setCnQty(lines.map(() => 0));
+    setCnReason("Sales return");
+  };
+  const remainingQty = (r, i) => (r._lines[i].qty || 0) - ((r.creditedQty || {})[String(i)] || 0);
+  const saveCredit = async () => {
+    const picks = cnFor._lines.map((_, i) => ({ index: i, qty: Number(cnQty[i] || 0) })).filter((p) => p.qty > 0);
+    if (!picks.length) { toast.error("Enter a quantity for at least one item"); return; }
+    try {
+      const r = await api.post(`/invoices/${cnFor.id}/credit-note`, { reason: cnReason, items: picks });
+      toast.success(`Credit note ${r.data.noteNo} created (${fmtInr(r.data.total)})`);
+      setCnFor(null); load();
+    } catch (e) { toast.error(e?.response?.data?.detail || "Failed"); }
+  };
+  const cancelInvoice = async (r) => {
+    if (!window.confirm(`Cancel invoice ${r.invoiceNo}? The number stays used and is reported as cancelled.`)) return;
+    try { await api.post(`/invoices/${r.id}/cancel`); toast.success("Invoice cancelled"); load(); }
+    catch (e) { toast.error(e?.response?.data?.detail || "Failed"); }
   };
 
   const view = (r) => { setViewInv(r); setViewOpen(true); };
@@ -47,6 +73,8 @@ export default function Invoices() {
     { key: "actions", header: "", align: "right", render: (r) => (
         <div className="flex items-center gap-2 justify-end">
           <button data-testid={`invoice-view-${r.id}`} onClick={(e) => { e.stopPropagation(); view(r); }} className="text-[11.5px] font-medium text-slate-600 hover:underline">View</button>
+          {!["CANCELLED", "CREDITED"].includes(r.status) && <button data-testid={`invoice-credit-${r.id}`} onClick={(e) => { e.stopPropagation(); openCredit(r); }} className="text-[11.5px] font-medium text-violet-600 hover:underline">Credit note</button>}
+          {r.status === "UNPAID" && !(r.paidAmount > 0) && !(r.creditedAmount > 0) && <button data-testid={`invoice-cancel-${r.id}`} onClick={(e) => { e.stopPropagation(); cancelInvoice(r); }} className="text-[11.5px] font-medium text-rose-600 hover:underline">Cancel</button>}
           {r.dueAmount > 0 && <button data-testid={`invoice-pay-${r.id}`} onClick={(e) => { e.stopPropagation(); openPay(r); }} className="text-[11.5px] font-medium text-[hsl(var(--primary))] hover:underline inline-flex items-center gap-1"><IndianRupee size={11} /> Record Payment</button>}
         </div>
       )
@@ -61,6 +89,8 @@ export default function Invoices() {
         <option value="UNPAID">Unpaid</option>
         <option value="PARTIAL">Partial</option>
         <option value="PAID">Paid</option>
+        <option value="CREDITED">Credited</option>
+        <option value="CANCELLED">Cancelled</option>
       </select>
       {(!loading && rows.length === 0) ? (
         <EmptyState icon={Receipt} title="No invoices yet" description="Invoices appear here after you generate them from orders." />
@@ -80,6 +110,30 @@ export default function Invoices() {
           <DialogFooter>
             <button onClick={() => setPayOpen(false)} className="px-3 py-2 rounded-lg text-[13px] text-slate-600 hover:bg-slate-100">Cancel</button>
             <button data-testid="save-payment" onClick={savePay} className="px-3 py-2 rounded-lg bg-[hsl(var(--primary))] text-white text-[13px]">Save Payment</button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!cnFor} onOpenChange={(o) => !o && setCnFor(null)}>
+        <DialogContent className="max-w-xl rounded-2xl">
+          <DialogHeader><DialogTitle>Credit note against {cnFor?.invoiceNo}</DialogTitle></DialogHeader>
+          {cnFor && (
+            <div className="space-y-3">
+              <div className="text-[12px] text-slate-500">Enter the quantity being returned or corrected. Tax reverses exactly as it was charged.</div>
+              <div className="border border-slate-200 rounded-lg overflow-hidden">
+                {cnFor._lines.map((l, i) => (
+                  <div key={i} className="flex items-center gap-3 px-3 py-2 border-b last:border-0 border-slate-100 text-[13px]">
+                    <div className="flex-1">{l.name}<div className="text-[11px] text-slate-500">invoiced {l.qty} · can credit {remainingQty(cnFor, i)}</div></div>
+                    <input data-testid={`cn-qty-${i}`} type="number" min="0" max={remainingQty(cnFor, i)} step="any" value={cnQty[i]} onChange={(e) => setCnQty(cnQty.map((q, k) => (k === i ? e.target.value : q)))} className="w-24 h-9 px-2 rounded-lg border border-slate-200 text-right font-mono" />
+                  </div>
+                ))}
+              </div>
+              <Field label="Reason" v={cnReason} on={setCnReason} />
+            </div>
+          )}
+          <DialogFooter>
+            <button onClick={() => setCnFor(null)} className="px-3 py-2 rounded-lg text-[13px] text-slate-600 hover:bg-slate-100">Cancel</button>
+            <button data-testid="save-credit-note" onClick={saveCredit} className="px-3 py-2 rounded-lg bg-violet-600 text-white text-[13px]">Create credit note</button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -125,6 +179,8 @@ function InvoiceView({ inv }) {
 }
 
 function InvoiceBody({ inv }) {
+  const company = useCompany();
+  const lines = inv.lines?.length ? inv.lines : null;
   return (
     <div className="p-8 bg-white">
       <div className="flex items-start justify-between border-b border-slate-100 pb-5">
@@ -135,8 +191,8 @@ function InvoiceBody({ inv }) {
         </div>
         <div className="text-right">
           <div className="text-[15px] font-semibold text-slate-900">GLC Zone Pvt Ltd</div>
-          <div className="text-[11.5px] text-slate-500">GSTIN 07AABCG1234H1Z5</div>
-          <div className="text-[11.5px] text-slate-500">New Delhi, India</div>
+          <div className="text-[11.5px] text-slate-500">GSTIN {company?.gstin}</div>
+          <div className="text-[11.5px] text-slate-500">{company?.state ? `Kishanganj, ${company.state}` : ""}</div>
         </div>
       </div>
       <div className="grid grid-cols-2 gap-6 mt-5">
@@ -145,6 +201,7 @@ function InvoiceBody({ inv }) {
           <div className="text-[14px] font-semibold text-slate-900 mt-1">{inv.customerName}</div>
           {inv.customerGst && <div className="text-[11.5px] text-slate-500 font-mono">GSTIN {inv.customerGst}</div>}
           {inv.customerState && <div className="text-[11.5px] text-slate-500">{inv.customerState}</div>}
+          {inv.placeOfSupply && <div className="text-[11.5px] text-slate-500">Place of supply: {inv.placeOfSupply}</div>}
         </div>
         <div className="text-right">
           <div className="text-[10.5px] uppercase tracking-wide text-slate-500 font-semibold">Amount Due</div>
@@ -159,14 +216,14 @@ function InvoiceBody({ inv }) {
           </tr>
         </thead>
         <tbody>
-          {(inv.items || []).map((it, i) => (
+          {(lines || inv.items || []).map((it, i) => (
             <tr key={i} className="border-b border-slate-100">
               <td className="py-2">{it.name}</td>
               <td className="py-2 font-mono text-[11.5px]">{it.hsn || "—"}</td>
               <td className="py-2 text-right font-mono">{it.qty}</td>
               <td className="py-2 text-right font-mono">{fmtInr(it.rate)}</td>
               <td className="py-2 text-right font-mono">{it.gstRate}%</td>
-              <td className="py-2 text-right font-mono">{fmtInr(it.qty * it.rate)}</td>
+              <td className="py-2 text-right font-mono">{fmtInr(it.total !== undefined ? it.total : it.qty * it.rate)}</td>
             </tr>
           ))}
         </tbody>
@@ -177,6 +234,7 @@ function InvoiceBody({ inv }) {
           {inv.cgst > 0 && <Row k="CGST" v={fmtInr(inv.cgst)} />}
           {inv.sgst > 0 && <Row k="SGST" v={fmtInr(inv.sgst)} />}
           {inv.igst > 0 && <Row k="IGST" v={fmtInr(inv.igst)} />}
+          {inv.roundOff ? <Row k="Round off" v={fmtInr(inv.roundOff)} /> : null}
           <div className="border-t border-slate-200 mt-2 pt-2 flex justify-between font-semibold">
             <span>Total</span><span className="font-mono tabular">{fmtInr(inv.total)}</span>
           </div>

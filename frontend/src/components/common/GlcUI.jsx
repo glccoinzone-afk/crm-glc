@@ -101,6 +101,8 @@ const statusStyles = {
   FAILED: "bg-rose-50 text-rose-700",
   CONVERTED: "bg-emerald-50 text-emerald-700",
   GENERATED: "bg-emerald-50 text-emerald-700",
+  CREDITED: "bg-violet-50 text-violet-700",
+  CANCELLED: "bg-slate-100 text-slate-500",
 };
 
 export function StatusBadge({ value, testId }) {
