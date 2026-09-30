@@ -2,6 +2,7 @@ import React from "react";
 import "@/App.css";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth, VerticalProvider } from "@/context/AuthContext";
+import { MobileNavProvider } from "@/context/MobileNavContext";
 import AppLayout from "@/components/Layout/AppLayout";
 import CommandPalette from "@/components/CommandPalette";
 import { canAccess } from "@/lib/rbac";
@@ -23,10 +24,12 @@ import Employees from "@/pages/hr/Employees";
 import Attendance from "@/pages/hr/Attendance";
 import Leaves from "@/pages/hr/Leaves";
 import Payroll from "@/pages/hr/Payroll";
-import { ChartOfAccounts, Journal, GstReports, Expenses } from "@/pages/finance/Finance";
-import { Projects, Tasks, Tickets, Documents, AuditLog, Settings } from "@/pages/misc/Misc";
+import { ChartOfAccounts, Journal, GstReports, ProfitLoss, Expenses } from "@/pages/finance/Finance";
+import { Projects, Tasks, Tickets, Documents, AuditLog } from "@/pages/misc/Misc";
+import Settings from "@/pages/Settings";
 import Inbox from "@/pages/ocm/Inbox";
 import { OcmContacts, Broadcasts, Flows, SocialScheduler, ContentCalendar } from "@/pages/ocm/Ocm";
+import SellerManagement from "@/pages/seller/SellerManagement";
 import { EmptyState } from "@/components/common/GlcUI";
 import { Lock } from "lucide-react";
 import { Toaster } from "sonner";
@@ -36,7 +39,7 @@ function Guard({ children, module }) {
   const { user, loading } = useAuth();
   if (loading) return <div className="min-h-screen grid place-items-center"><Loader2 className="animate-spin text-[hsl(var(--primary))]" /></div>;
   if (!user) return <Navigate to="/login" replace />;
-  if (module && !canAccess(user.role || "Admin", module)) {
+  if (module && !canAccess(user.role || "Admin", module, user.modules)) {
     return (
       <AppLayout>
         <div className="pt-10">
@@ -77,6 +80,7 @@ function AppRoutes() {
       <Route path="/finance/accounts" element={<Guard module="finance.accounts"><ChartOfAccounts /></Guard>} />
       <Route path="/finance/journal" element={<Guard module="finance.journal"><Journal /></Guard>} />
       <Route path="/finance/gst" element={<Guard module="finance.gst"><GstReports /></Guard>} />
+      <Route path="/finance/pl" element={<Guard module="finance.pl"><ProfitLoss /></Guard>} />
       <Route path="/finance/expenses" element={<Guard module="finance.expenses"><Expenses /></Guard>} />
       <Route path="/projects" element={<Guard module="projects"><Projects /></Guard>} />
       <Route path="/tasks" element={<Guard module="tasks"><Tasks /></Guard>} />
@@ -88,6 +92,7 @@ function AppRoutes() {
       <Route path="/ocm/flows" element={<Guard module="ocm.flows"><Flows /></Guard>} />
       <Route path="/ocm/social" element={<Guard module="ocm.social"><SocialScheduler /></Guard>} />
       <Route path="/ocm/calendar" element={<Guard module="ocm.calendar"><ContentCalendar /></Guard>} />
+      <Route path="/sellers" element={<Guard module="*"><SellerManagement /></Guard>} />
       <Route path="/audit" element={<Guard module="audit"><AuditLog /></Guard>} />
       <Route path="/settings" element={<Guard module="settings"><Settings /></Guard>} />
       <Route path="*" element={<Navigate to="/" replace />} />
@@ -97,12 +102,14 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename="/crm">
       <AuthProvider>
+        <MobileNavProvider>
         <VerticalProvider>
           <AppRoutes />
           <Toaster position="bottom-right" richColors closeButton />
         </VerticalProvider>
+        </MobileNavProvider>
       </AuthProvider>
     </BrowserRouter>
   );

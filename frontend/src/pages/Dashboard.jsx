@@ -3,7 +3,8 @@ import { motion } from "framer-motion";
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, LineChart, Line } from "recharts";
 import { ShoppingCart, IndianRupee, Users, Package, Receipt, LifeBuoy, UserSquare2, Truck, UserRound, CalendarCheck2, ArrowUpRight, Sparkles, TriangleAlert, BadgeIndianRupee } from "lucide-react";
 import api, { fmtInr, fmtDate } from "@/lib/glc";
-import { useVertical } from "@/context/AuthContext";
+import { useVertical, useAuth } from "@/context/AuthContext";
+import { canAccess } from "@/lib/rbac";
 import { PageHeader, StatCard, StatusBadge } from "@/components/common/GlcUI";
 import { Link } from "react-router-dom";
 
@@ -26,6 +27,9 @@ function ChartCard({ title, subtitle, children, action, testId }) {
 
 export default function Dashboard() {
   const { vertical } = useVertical();
+  const { user } = useAuth();
+  const role = user?.role || "Admin";
+  const mods = user?.modules;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -37,18 +41,20 @@ export default function Dashboard() {
 
   const k = data?.kpi || {};
 
-  const kpiCards = [
-    { label: "Today's Revenue", value: fmtInr(k.todayRevenue), icon: IndianRupee, tone: "primary", testId: "kpi-revenue" },
-    { label: "Today's Orders", value: k.todayOrders ?? 0, icon: ShoppingCart, tone: "accent", testId: "kpi-orders" },
-    { label: "New Customers", value: k.newCustomers ?? 0, icon: Users, tone: "success", testId: "kpi-customers" },
-    { label: "Pending Orders", value: k.pendingOrders ?? 0, icon: Package, tone: "warn", testId: "kpi-pending-orders" },
-    { label: "Unpaid Invoices", value: fmtInr(k.unpaidAmount), icon: Receipt, tone: "danger", testId: "kpi-unpaid" },
-    { label: "Open Tickets", value: k.openTickets ?? 0, icon: LifeBuoy, tone: "slate", testId: "kpi-tickets" },
-    { label: "Total Leads", value: k.totalLeads ?? 0, icon: UserSquare2, tone: "primary", testId: "kpi-leads" },
-    { label: "Pending Deliveries", value: k.pendingDeliveries ?? 0, icon: Truck, tone: "accent", testId: "kpi-deliveries" },
-    { label: "Employees", value: k.employeeCount ?? 0, icon: UserRound, tone: "slate", testId: "kpi-employees" },
-    { label: "Today's Attendance", value: k.todayAttendance ?? 0, icon: CalendarCheck2, tone: "success", testId: "kpi-attendance" },
+  const allKpiCards = [
+    { label: "Today's Revenue", value: fmtInr(k.todayRevenue), icon: IndianRupee, tone: "primary", testId: "kpi-revenue", mod: "sales.orders" },
+    { label: "Today's Orders", value: k.todayOrders ?? 0, icon: ShoppingCart, tone: "accent", testId: "kpi-orders", mod: "sales.orders" },
+    { label: "New Customers", value: k.newCustomers ?? 0, icon: Users, tone: "success", testId: "kpi-customers", mod: "crm.customers" },
+    { label: "Pending Orders", value: k.pendingOrders ?? 0, icon: Package, tone: "warn", testId: "kpi-pending-orders", mod: "sales.orders" },
+    { label: "Unpaid Invoices", value: fmtInr(k.unpaidAmount), icon: Receipt, tone: "danger", testId: "kpi-unpaid", mod: "sales.invoices" },
+    { label: "Open Tickets", value: k.openTickets ?? 0, icon: LifeBuoy, tone: "slate", testId: "kpi-tickets", mod: "tickets" },
+    { label: "Total Leads", value: k.totalLeads ?? 0, icon: UserSquare2, tone: "primary", testId: "kpi-leads", mod: "crm.leads" },
+    { label: "Pending Deliveries", value: k.pendingDeliveries ?? 0, icon: Truck, tone: "accent", testId: "kpi-deliveries", mod: "delivery" },
+    { label: "Employees", value: k.employeeCount ?? 0, icon: UserRound, tone: "slate", testId: "kpi-employees", mod: "hr.employees" },
+    { label: "Today's Attendance", value: k.todayAttendance ?? 0, icon: CalendarCheck2, tone: "success", testId: "kpi-attendance", mod: "hr.attendance" },
   ];
+
+  const kpiCards = allKpiCards.filter((c) => canAccess(role, c.mod, mods));
 
   return (
     <div className="space-y-6">
@@ -77,6 +83,7 @@ export default function Dashboard() {
 
       {/* Charts row */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        {canAccess(role, "sales.orders", mods) && (
         <ChartCard testId="chart-revenue" title="Revenue Trend" subtitle="Last 6 months revenue across the business">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={data?.charts?.revenueSeries || []}>
@@ -94,7 +101,9 @@ export default function Dashboard() {
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        )}
 
+        {canAccess(role, "sales.orders", mods) && (
         <ChartCard testId="chart-sales-vertical" title="Sales by Vertical" subtitle="Order value split across GLC verticals">
           <ResponsiveContainer width="100%" height={260}>
             <PieChart>
@@ -113,7 +122,9 @@ export default function Dashboard() {
             ))}
           </div>
         </ChartCard>
+        )}
 
+        {canAccess(role, "crm.leads", mods) && (
         <ChartCard testId="chart-funnel" title="Lead Conversion Funnel" subtitle="Leads by pipeline stage">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={data?.charts?.leadFunnel || []} layout="vertical" margin={{ left: 10 }}>
@@ -127,10 +138,12 @@ export default function Dashboard() {
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
+        )}
       </div>
 
       {/* Bottom row: recent + lowstock + attendance */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        {canAccess(role, "sales.orders", mods) && (
         <div className="xl:col-span-2 bg-white rounded-2xl border border-slate-200/70 card-elev">
           <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
             <div>
@@ -167,8 +180,10 @@ export default function Dashboard() {
             </table>
           </div>
         </div>
+        )}
 
         <div className="space-y-4">
+          {canAccess(role, "inventory.stock", mods) && (
           <div className="bg-white rounded-2xl border border-slate-200/70 card-elev p-5" data-testid="low-stock">
             <div className="flex items-center gap-2 mb-3">
               <TriangleAlert size={16} className="text-amber-500" />
@@ -192,6 +207,7 @@ export default function Dashboard() {
               )}
             </ul>
           </div>
+          )}
 
           <div className="bg-white rounded-2xl border border-slate-200/70 card-elev p-5" data-testid="approvals">
             <div className="flex items-center gap-2 mb-3">
@@ -200,10 +216,10 @@ export default function Dashboard() {
             </div>
             <div className="grid grid-cols-3 gap-2">
               {[
-                { label: "Leaves", val: data?.pending?.leaves, to: "/hr/leaves" },
-                { label: "Expenses", val: data?.pending?.expenses, to: "/finance/expenses" },
-                { label: "POs", val: data?.pending?.purchaseOrders, to: "/purchase/orders" },
-              ].map((x) => (
+                { label: "Leaves", val: data?.pending?.leaves, to: "/hr/leaves", mod: "hr.leaves" },
+                { label: "Expenses", val: data?.pending?.expenses, to: "/finance/expenses", mod: "finance.expenses" },
+                { label: "POs", val: data?.pending?.purchaseOrders, to: "/purchase/orders", mod: "purchase.orders" },
+              ].filter((x) => canAccess(role, x.mod, mods)).map((x) => (
                 <Link key={x.label} to={x.to} className="rounded-xl border border-slate-100 bg-slate-50 hover:bg-slate-100/70 p-3 text-center">
                   <div className="text-[22px] font-semibold tabular text-slate-900">{x.val ?? 0}</div>
                   <div className="text-[11px] text-slate-500">{x.label}</div>

@@ -3,6 +3,7 @@ import { Plus, Search, Users, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import api, { fmtInr } from "@/lib/glc";
 import { PageHeader, DataGrid, EmptyState } from "@/components/common/GlcUI";
+import { RefreshCw } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Field, SelectField } from "@/pages/crm/Leads";
 import { toast } from "sonner";
@@ -17,6 +18,23 @@ export default function Customers() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ name: "", email: "", phone: "", company: "", gst: "", pan: "", type: "RETAIL", creditLimit: 0, state: "" });
 
+  const [syncing, setSyncing] = useState(false);
+  const [canSync, setCanSync] = useState(false);
+  useEffect(() => {
+    api.get("/rbac/me").then((r) => {
+      const perms = r.data.modules || [];
+      setCanSync(perms.includes("*") || perms.some((p) => ["crm", "crm.customers"].includes(p)));
+    });
+  }, []);
+  const syncCustomers = async () => {
+    setSyncing(true);
+    try {
+      const r = await api.post("/sync/customers");
+      toast.success(`Synced: ${r.data.created} new, ${r.data.updated} updated`);
+      load();
+    } catch { toast.error("Sync failed"); }
+    finally { setSyncing(false); }
+  };
   const load = () => {
     setLoading(true);
     api.get("/customers", { params: q ? { q } : {} }).then((r) => setRows(r.data.items || [])).finally(() => setLoading(false));
@@ -60,16 +78,24 @@ export default function Customers() {
 
   return (
     <div className="space-y-6">
-      <PageHeader
-        testId="customers-page"
-        title="Customers"
-        subtitle="360° view of every customer relationship"
-        actions={
-          <button data-testid="new-customer-btn" onClick={() => setOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90">
+      <div className="flex items-center justify-between">
+        <PageHeader
+          testId="customers-page"
+          title="Customers"
+          subtitle="360° view of every customer relationship"
+          actions={
+            <button data-testid="new-customer-btn" onClick={() => setOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90">
             <Plus size={14} /> New Customer
           </button>
         }
-      />
+        />
+        {canSync && (
+          <button onClick={syncCustomers} disabled={syncing} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 text-[12.5px] font-medium hover:bg-slate-50 disabled:opacity-50">
+            <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />
+            {syncing ? "Syncing…" : "Sync glczone.in"}
+          </button>
+        )}
+      </div>
       <div className="relative max-w-sm">
         <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
         <input data-testid="customer-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search customers…" className="w-full h-10 pl-9 pr-3 rounded-lg bg-white border border-slate-200 text-[13px] outline-none focus:border-[hsl(var(--primary))]" />

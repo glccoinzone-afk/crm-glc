@@ -126,6 +126,48 @@ export function GstReports() {
   );
 }
 
+export function ProfitLoss() {
+  const [data, setData] = useState(null);
+  const ref = useRef(null);
+  const print = useReactToPrint({ contentRef: ref, documentTitle: "Profit-and-Loss" });
+  useEffect(() => { api.get("/reports/pl").then((r) => setData(r.data)); }, []);
+  const revenue = data?.revenue || 0;
+  const expenses = data?.expenses || 0;
+  const netProfit = data?.netProfit || 0;
+  return (
+    <div className="space-y-6">
+      <PageHeader testId="pl-page" title="Profit & Loss" subtitle="Revenue, expenses and net profit at a glance" actions={
+        <button data-testid="pl-print" onClick={print} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"><Printer size={13} /> Print / PDF</button>
+      }/>
+      <div ref={ref}>
+        <div className="hidden print:block px-6 pt-6 pb-3 border-b border-slate-200 mb-4">
+          <div className="text-[11px] uppercase tracking-wide text-slate-500">Profit &amp; Loss Statement</div>
+          <div className="text-[22px] font-semibold text-slate-900">GLC Zone Pvt Ltd</div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+          <StatCard label="Revenue" value={fmtInr(revenue)} icon={BarChart3} tone="accent" />
+          <StatCard label="Expenses" value={fmtInr(expenses)} icon={Wallet} tone="warn" />
+          <StatCard label="Net Profit" value={fmtInr(netProfit)} icon={ScrollText} tone={netProfit >= 0 ? "success" : "danger"} />
+        </div>
+        <div className="bg-white rounded-2xl border border-slate-200/70 card-elev p-6 max-w-lg">
+          <div className="flex items-center justify-between py-2.5 border-b border-slate-100">
+            <span className="text-[13.5px] text-slate-600">Total Revenue</span>
+            <span className="text-[14px] font-mono font-medium text-slate-900">{fmtInr(revenue)}</span>
+          </div>
+          <div className="flex items-center justify-between py-2.5 border-b border-slate-100">
+            <span className="text-[13.5px] text-slate-600">Total Expenses (Approved)</span>
+            <span className="text-[14px] font-mono font-medium text-slate-900">- {fmtInr(expenses)}</span>
+          </div>
+          <div className="flex items-center justify-between py-3">
+            <span className="text-[14px] font-semibold text-slate-900">Net Profit</span>
+            <span className={`text-[16px] font-mono font-semibold ${netProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtInr(netProfit)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function Expenses() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Plus, Package } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import api, { fmtInr } from "@/lib/glc";
 import { PageHeader, DataGrid, EmptyState } from "@/components/common/GlcUI";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -8,6 +9,23 @@ import { toast } from "sonner";
 
 export default function Products() {
   const [rows, setRows] = useState([]);
+  const [syncing, setSyncing] = useState(false);
+  const [canSync, setCanSync] = useState(false);
+  useEffect(() => {
+    api.get("/rbac/me").then((r) => {
+      const perms = r.data.modules || [];
+      setCanSync(perms.includes("*") || perms.some((p) => ["inventory", "inventory.products"].includes(p)));
+    });
+  }, []);
+  const syncNow = async () => {
+    setSyncing(true);
+    try {
+      const r = await api.post("/sync/products");
+      toast.success(`Synced: ${r.data.created} new, ${r.data.updated} updated`);
+      load();
+    } catch { toast.error("Sync failed"); }
+    finally { setSyncing(false); }
+  };
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
@@ -40,11 +58,11 @@ export default function Products() {
 
   return (
     <div className="space-y-6">
-      <PageHeader testId="products-page" title="Products" subtitle="Master catalog across every business vertical" actions={
+      <PageHeader testId="products-page" title="Products" subtitle="Master catalog across every business vertical" actions={<div className="flex gap-2">{canSync && <button onClick={syncNow} disabled={syncing} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 text-[12.5px] font-medium hover:bg-slate-50 disabled:opacity-50"><RefreshCw size={13} className={syncing?"animate-spin":""}/>{syncing?"Syncing…":"Sync glczone.in"}</button>}
         <button data-testid="new-product-btn" onClick={() => setOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90">
           <Plus size={14} /> New Product
         </button>
-      }/>
+      </div>}/>
       <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search products…" className="w-full max-w-sm h-10 px-3 rounded-lg bg-white border border-slate-200 text-[13px] outline-none focus:border-[hsl(var(--primary))]" data-testid="product-search" />
       {(!loading && rows.length === 0) ? <EmptyState icon={Package} title="No products yet" description="Add your first product to start selling." /> : <DataGrid columns={columns} rows={rows} loading={loading} testId="products-grid" />}
 

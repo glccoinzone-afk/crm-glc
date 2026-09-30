@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Plus, Users, Send, Megaphone, Bot, CalendarDays, Sparkles, Loader2, Trash2 } from "lucide-react";
+import { Plus, Users, Send, Megaphone, Bot, CalendarDays, Sparkles, Loader2, Trash2, X } from "lucide-react";
 import { motion } from "framer-motion";
 import api, { fmtDate } from "@/lib/glc";
 import { PageHeader, DataGrid, StatusBadge, EmptyState, StatCard } from "@/components/common/GlcUI";
@@ -63,7 +63,16 @@ export function Broadcasts() {
   const load = () => { setLoading(true); api.get("/ocm/broadcasts").then((r) => setRows(r.data.items || [])).finally(() => setLoading(false)); };
   useEffect(load, []);
   const save = async () => { if (!form.name || !form.message) return toast.error("Name & message required"); await api.post("/ocm/broadcasts", form); toast.success("Broadcast saved"); setOpen(false); load(); };
-  const send = async (r) => { await api.post(`/ocm/broadcasts/${r.id}/send`); toast.success(`Broadcast sent (mocked)`); load(); };
+  const send = async (r) => {
+    const res = await api.post(`/ocm/broadcasts/${r.id}/send`);
+    const { sent = 0, failed = 0 } = res.data || {};
+    if (failed > 0) {
+      toast.success(`Sent to ${sent}, ${failed} failed`);
+    } else {
+      toast.success(`Sent to ${sent} contacts`);
+    }
+    load();
+  };
   const toggleCh = (c) => { const has = form.channels.includes(c); setForm({ ...form, channels: has ? form.channels.filter((x) => x !== c) : [...form.channels, c] }); };
 
   const columns = [
@@ -104,7 +113,8 @@ export function Broadcasts() {
                 ))}
               </div>
             </div>
-            <SelectField label="Audience" v={form.audience} on={(v) => setForm({ ...form, audience: v })} opts={["ALL", "TRADERS", "RETAIL", "VIP"]} />
+            <SelectField label="Audience" v={form.audience} on={(v) => setForm({ ...form, audience: v })} opts={["ALL", "RETAIL", "WHOLESALE", "DISTRIBUTOR", "VIP"]} />
+            <div className="text-[11px] text-slate-400 -mt-2">Filters by customer type; matches CRM contact tags too</div>
             <label className="text-[11.5px] font-medium text-slate-600 block">Message
               <textarea value={form.message} onChange={(e) => setForm({ ...form, message: e.target.value })} rows={4} className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-[13px] outline-none focus:border-[hsl(var(--primary))]" data-testid="bcast-message" />
             </label>
@@ -120,20 +130,64 @@ export function Broadcasts() {
 }
 
 // ---------- Chatbot Flows ----------
+const FLOW_TRIGGER_OPTS = ["KEYWORD", "WELCOME"];
+const emptyFlowForm = () => ({ name: "", channel: "TELEGRAM", trigger: "KEYWORD", triggerValue: "", status: "DRAFT", steps: [{ type: "MESSAGE", text: "" }] });
+
 export function Flows() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ name: "", channel: "TELEGRAM", trigger: "KEYWORD", triggerValue: "", status: "DRAFT", steps: [{ type: "MESSAGE", text: "" }] });
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyFlowForm());
   const load = () => { setLoading(true); api.get("/ocm/flows").then((r) => setRows(r.data.items || [])).finally(() => setLoading(false)); };
   useEffect(load, []);
-  const save = async () => { if (!form.name) return; await api.post("/ocm/flows", form); toast.success("Flow created"); setOpen(false); load(); };
+
+  const openNew = () => { setEditingId(null); setForm(emptyFlowForm()); setOpen(true); };
+  const openEdit = (f) => {
+    setEditingId(f.id);
+    setForm({
+      name: f.name || "",
+      channel: f.channel || "TELEGRAM",
+      trigger: f.trigger || "KEYWORD",
+      triggerValue: f.triggerValue || "",
+      status: f.status || "DRAFT",
+      steps: (f.steps && f.steps.length > 0) ? f.steps.map((s) => ({ type: s.type || "MESSAGE", text: s.text || "" })) : [{ type: "MESSAGE", text: "" }],
+    });
+    setOpen(true);
+  };
+
+  const save = async () => {
+    if (!form.name) return;
+    const cleanSteps = form.steps.filter((s) => (s.text || "").trim() !== "");
+    const payload = { ...form, steps: cleanSteps.length > 0 ? cleanSteps : [{ type: "MESSAGE", text: "" }] };
+    if (editingId) {
+      await api.put(`/ocm/flows/${editingId}`, payload);
+      toast.success("Flow updated");
+    } else {
+      await api.post("/ocm/flows", payload);
+      toast.success("Flow created");
+    }
+    setOpen(false);
+    load();
+  };
+
   const toggleStatus = async (r) => { const ns = r.status === "ACTIVE" ? "PAUSED" : "ACTIVE"; await api.put(`/ocm/flows/${r.id}`, { status: ns }); toast.success(ns); load(); };
+
+  const addStep = () => setForm({ ...form, steps: [...form.steps, { type: "MESSAGE", text: "" }] });
+  const removeStep = (i) => setForm({ ...form, steps: form.steps.filter((_, idx) => idx !== i) });
+  const updateStep = (i, text) => setForm({ ...form, steps: form.steps.map((s, idx) => (idx === i ? { ...s, text } : s)) });
+  const moveStep = (i, dir) => {
+    const j = i + dir;
+    if (j < 0 || j >= form.steps.length) return;
+    const next = [...form.steps];
+    [next[i], next[j]] = [next[j], next[i]];
+    setForm({ ...form, steps: next });
+  };
 
   return (
     <div className="space-y-6">
       <PageHeader testId="flows-page" title="Chatbot Flows" subtitle="Automated conversation flows across your channels" actions={
-        <button data-testid="new-flow-btn" onClick={() => setOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"><Plus size={14} /> New Flow</button>
+        <button data-testid="new-flow-btn" onClick={openNew} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"><Plus size={14} /> New Flow</button>
       }/>
       {(!loading && rows.length === 0) ? <EmptyState icon={Bot} title="No flows yet" /> : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -158,7 +212,10 @@ export function Flows() {
               </div>
               <div className="mt-4 flex justify-between items-center">
                 <div className="text-[10.5px] text-slate-400">Created {fmtDate(f.createdAt)}</div>
-                <button data-testid={`flow-toggle-${f.id}`} onClick={() => toggleStatus(f)} className="text-[11.5px] font-medium text-[hsl(var(--primary))] hover:underline">{f.status === "ACTIVE" ? "Pause" : "Activate"}</button>
+                <div className="flex items-center gap-3">
+                  <button data-testid={`flow-edit-${f.id}`} onClick={() => openEdit(f)} className="text-[11.5px] font-medium text-slate-500 hover:underline">Edit</button>
+                  <button data-testid={`flow-toggle-${f.id}`} onClick={() => toggleStatus(f)} className="text-[11.5px] font-medium text-[hsl(var(--primary))] hover:underline">{f.status === "ACTIVE" ? "Pause" : "Activate"}</button>
+                </div>
               </div>
             </div>
           ))}
@@ -166,22 +223,49 @@ export function Flows() {
       )}
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-lg rounded-2xl">
-          <DialogHeader><DialogTitle>New Chatbot Flow</DialogTitle></DialogHeader>
+        <DialogContent className="max-w-lg rounded-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader><DialogTitle>{editingId ? "Edit Chatbot Flow" : "New Chatbot Flow"}</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <Field label="Flow Name*" v={form.name} on={(v) => setForm({ ...form, name: v })} tid="flow-name" />
             <div className="grid grid-cols-2 gap-3">
               <SelectField label="Channel" v={form.channel} on={(v) => setForm({ ...form, channel: v })} opts={CHANNEL_OPTS} />
-              <SelectField label="Trigger" v={form.trigger} on={(v) => setForm({ ...form, trigger: v })} opts={["KEYWORD", "COMMAND", "EVENT"]} />
+              <SelectField label="Trigger" v={form.trigger} on={(v) => setForm({ ...form, trigger: v })} opts={FLOW_TRIGGER_OPTS} />
             </div>
-            <Field label="Trigger Value" v={form.triggerValue} on={(v) => setForm({ ...form, triggerValue: v })} />
-            <label className="text-[11.5px] font-medium text-slate-600 block">First message
-              <textarea value={form.steps[0]?.text || ""} onChange={(e) => setForm({ ...form, steps: [{ type: "MESSAGE", text: e.target.value }] })} rows={3} className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-[13px]" />
-            </label>
+            {form.trigger === "KEYWORD" && (
+              <Field label="Trigger Keyword*" v={form.triggerValue} on={(v) => setForm({ ...form, triggerValue: v })} />
+            )}
+            {form.trigger === "WELCOME" && (
+              <div className="text-[11.5px] text-slate-500 bg-slate-50 border border-slate-100 rounded-lg px-3 py-2">Runs automatically on a contact's first message — no keyword needed.</div>
+            )}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[11.5px] font-medium text-slate-600">Messages (sent in order)</span>
+                <button type="button" onClick={addStep} className="text-[11.5px] font-medium text-[hsl(var(--primary))] hover:underline inline-flex items-center gap-1"><Plus size={12} /> Add Step</button>
+              </div>
+              <div className="space-y-2">
+                {form.steps.map((s, i) => (
+                  <div key={i} className="flex items-start gap-2">
+                    <span className="text-[10.5px] font-semibold text-slate-400 mt-2.5 w-4 text-right">{i + 1}</span>
+                    <textarea
+                      value={s.text}
+                      onChange={(e) => updateStep(i, e.target.value)}
+                      rows={2}
+                      placeholder={`Step ${i + 1} message…`}
+                      className="flex-1 px-3 py-2 rounded-lg border border-slate-200 text-[13px]"
+                    />
+                    <div className="flex flex-col gap-1 mt-0.5">
+                      <button type="button" onClick={() => moveStep(i, -1)} disabled={i === 0} className="text-[10px] text-slate-400 hover:text-slate-600 disabled:opacity-30">▲</button>
+                      <button type="button" onClick={() => moveStep(i, 1)} disabled={i === form.steps.length - 1} className="text-[10px] text-slate-400 hover:text-slate-600 disabled:opacity-30">▼</button>
+                    </div>
+                    <button type="button" onClick={() => removeStep(i)} disabled={form.steps.length === 1} className="text-slate-400 hover:text-red-500 disabled:opacity-30 mt-1.5"><X size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
           <DialogFooter>
             <button onClick={() => setOpen(false)} className="px-3 py-2 rounded-lg text-[13px] text-slate-600 hover:bg-slate-100">Cancel</button>
-            <button data-testid="save-flow" onClick={save} className="px-3 py-2 rounded-lg bg-[hsl(var(--primary))] text-white text-[13px]">Create Flow</button>
+            <button data-testid="save-flow" onClick={save} className="px-3 py-2 rounded-lg bg-[hsl(var(--primary))] text-white text-[13px]">{editingId ? "Save Changes" : "Create Flow"}</button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

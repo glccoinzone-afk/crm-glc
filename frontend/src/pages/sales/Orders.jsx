@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Receipt, Trash2 } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import api, { fmtInr, fmtDate } from "@/lib/glc";
 import { PageHeader, DataGrid, EmptyState, StatusBadge } from "@/components/common/GlcUI";
 import { toast } from "sonner";
@@ -8,6 +9,23 @@ import { toast } from "sonner";
 export default function Orders() {
   const nav = useNavigate();
   const [rows, setRows] = useState([]);
+  const [syncing, setSyncing] = useState(false);
+  const [canSync, setCanSync] = useState(false);
+  useEffect(() => {
+    api.get("/rbac/me").then((r) => {
+      const perms = r.data.modules || [];
+      setCanSync(perms.includes("*") || perms.some((p) => ["sales", "sales.orders"].includes(p)));
+    });
+  }, []);
+  const syncNow = async () => {
+    setSyncing(true);
+    try {
+      const r = await api.post("/sync/orders-crm");
+      toast.success(`Synced: ${r.data.created} new, ${r.data.updated} updated`);
+      load();
+    } catch { toast.error("Sync failed"); }
+    finally { setSyncing(false); }
+  };
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("");
 
@@ -46,7 +64,10 @@ export default function Orders() {
 
   return (
     <div className="space-y-6">
-      <PageHeader testId="orders-page" title="Sales Orders" subtitle="Confirm, fulfill and invoice orders across every store" />
+      <div className="flex items-center justify-between">
+        <PageHeader testId="orders-page" title="Sales Orders" subtitle="Confirm, fulfill and invoice orders across every store" />
+        {canSync && <button onClick={syncNow} disabled={syncing} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 text-[12.5px] font-medium hover:bg-slate-50 disabled:opacity-50"><RefreshCw size={13} className={syncing?"animate-spin":""} />{syncing?"Syncing…":"Sync glczone.in"}</button>}
+      </div>
       <div className="flex gap-2">
         <select data-testid="orders-status-filter" value={status} onChange={(e) => setStatus(e.target.value)} className="h-10 px-3 rounded-lg bg-white border border-slate-200 text-[13px] outline-none">
           {STATUSES.map((s) => <option key={s} value={s}>{s || "All statuses"}</option>)}

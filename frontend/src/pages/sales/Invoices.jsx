@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Receipt, IndianRupee, Printer } from "lucide-react";
+import { Receipt, IndianRupee, Printer, Download } from "lucide-react";
 import { useReactToPrint } from "react-to-print";
 import api, { fmtInr, fmtDate } from "@/lib/glc";
 import { PageHeader, DataGrid, EmptyState, StatusBadge } from "@/components/common/GlcUI";
@@ -100,9 +100,22 @@ function InvoiceView({ inv }) {
     <div>
       <div className="flex items-center justify-between px-6 pt-5 pb-3 border-b border-slate-100">
         <div className="text-[13px] font-semibold text-slate-500">Invoice Preview</div>
-        <button data-testid="invoice-print" onClick={print} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90">
-          <Printer size={13} /> Print / PDF
-        </button>
+        <div className="flex gap-2">
+          <button data-testid="invoice-print" onClick={print} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90">
+            <Printer size={13} /> Print
+          </button>
+          <button onClick={async () => {
+            try {
+              const r = await api.get(`/invoices/${inv.id}/pdf`, { responseType: "blob" });
+              const url = URL.createObjectURL(r.data);
+              const a = document.createElement("a");
+              a.href = url; a.download = `${inv.invoiceNo}.pdf`; a.click();
+              URL.revokeObjectURL(url);
+            } catch(e) { alert("PDF download failed"); }
+          }} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-slate-100 text-slate-700 hover:bg-slate-200">
+            <Download size={13} /> Download PDF
+          </button>
+        </div>
       </div>
       <div ref={printRef}>
         <InvoiceBody inv={inv} />

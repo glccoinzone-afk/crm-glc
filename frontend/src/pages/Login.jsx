@@ -1,34 +1,54 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { Sparkles, Loader2, Mail, Lock } from "lucide-react";
+import { Sparkles, Loader2, IdCard, KeyRound, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
+import api from "@/lib/glc";
 
 export default function Login() {
   const nav = useNavigate();
   const { login } = useAuth();
-  const [email, setEmail] = useState("bishwajeet@glczone.in");
-  const [password, setPassword] = useState("Admin@123");
+  const [employeeCode, setEmployeeCode] = useState("");
+  const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
+  const [twoFAMode, setTwoFAMode] = useState(false);
+  const [tempToken, setTempToken] = useState("");
+  const [otp, setOtp] = useState("");
 
   const submit = async (e) => {
     e.preventDefault();
     setLoading(true);
     try {
-      await login(email, password);
-      toast.success("Welcome back to GLC Zone");
-      nav("/");
+      const res = await login(employeeCode.trim(), pin.trim());
+      if (res?.requires_2fa) {
+        setTempToken(res.temp_token);
+        setTwoFAMode(true);
+        toast.info("Enter your 2FA code to continue");
+      } else {
+        toast.success("Welcome back to GLC Zone");
+        nav("/");
+      }
     } catch (err) {
-      toast.error(err?.response?.data?.detail || "Login failed");
+      toast.error(err?.response?.data?.detail || "Invalid Employee ID or PIN");
     } finally {
       setLoading(false);
     }
   };
 
-  const quickPick = (e) => {
-    setEmail(e);
-    setPassword("Admin@123");
+  const verify2FA = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const r = await api.post("/auth/2fa/verify", { temp_token: tempToken, code: otp });
+      localStorage.setItem("glc_token", r.data.token);
+      localStorage.setItem("glc_user", JSON.stringify(r.data.user));
+      window.location.href = "/crm";
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Invalid OTP code");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -69,67 +89,55 @@ export default function Login() {
             </div>
             <div className="text-lg font-semibold">GLC Zone</div>
           </div>
-          <h2 className="text-2xl font-semibold tracking-tight text-slate-900">Sign in to your workspace</h2>
-          <p className="text-[13.5px] text-slate-500 mt-1.5">Enter your GLC Zone credentials to continue.</p>
 
-          <form onSubmit={submit} className="mt-8 space-y-4">
-            <div>
-              <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Email</label>
-              <div className="mt-1.5 relative">
-                <Mail size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  data-testid="login-email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  type="email"
-                  className="w-full h-11 pl-10 pr-3 rounded-xl border border-slate-200 focus:border-[hsl(var(--primary))] outline-none text-[14px]"
-                />
-              </div>
-            </div>
-            <div>
-              <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Password</label>
-              <div className="mt-1.5 relative">
-                <Lock size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  data-testid="login-password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  type="password"
-                  className="w-full h-11 pl-10 pr-3 rounded-xl border border-slate-200 focus:border-[hsl(var(--primary))] outline-none text-[14px]"
-                />
-              </div>
-            </div>
-            <button
-              data-testid="login-submit"
-              disabled={loading}
-              className="w-full h-11 rounded-xl bg-[hsl(var(--primary))] text-white text-[14px] font-medium hover:bg-[hsl(var(--primary))]/90 disabled:opacity-70 active:scale-[0.99] transition-transform grid place-items-center"
-            >
-              {loading ? <Loader2 className="animate-spin" size={16} /> : "Sign in"}
-            </button>
-          </form>
-
-          <div className="mt-8">
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-2">Quick sign-in (demo)</div>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                { name: "Super Admin", email: "bishwajeet@glczone.in" },
-                { name: "Admin", email: "riddhi@glczone.in" },
-                { name: "Manager", email: "dev@glczone.in" },
-                { name: "Support Exec", email: "danish@glczone.in" },
-              ].map((p) => (
-                <button
-                  key={p.email}
-                  type="button"
-                  data-testid={`quick-login-${p.name.toLowerCase().replace(/\s+/g, "-")}`}
-                  onClick={() => quickPick(p.email)}
-                  className="text-left px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-[12px]"
-                >
-                  <div className="font-medium text-slate-800">{p.name}</div>
-                  <div className="text-slate-500 truncate">{p.email}</div>
+          {!twoFAMode ? (
+            <>
+              <h2 className="text-2xl font-semibold tracking-tight text-slate-900">Sign in to your workspace</h2>
+              <p className="text-[13.5px] text-slate-500 mt-1.5">Enter your Employee ID and PIN to continue.</p>
+              <form onSubmit={submit} className="mt-8 space-y-4">
+                <div>
+                  <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Employee ID</label>
+                  <div className="mt-1.5 relative">
+                    <IdCard size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input data-testid="login-employee-id" value={employeeCode} onChange={(e) => setEmployeeCode(e.target.value.toUpperCase())} type="text" placeholder="EMP-XXXXX" className="w-full h-11 pl-10 pr-3 rounded-xl border border-slate-200 focus:border-[hsl(var(--primary))] outline-none text-[14px] font-mono tracking-wide" autoComplete="off" />
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">4-Digit PIN</label>
+                  <div className="mt-1.5 relative">
+                    <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input data-testid="login-pin" value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 4))} type="password" inputMode="numeric" maxLength={4} placeholder="••••" className="w-full h-11 pl-10 pr-3 rounded-xl border border-slate-200 focus:border-[hsl(var(--primary))] outline-none text-[16px] font-mono tracking-[0.4em]" autoComplete="off" />
+                  </div>
+                </div>
+                <button data-testid="login-submit" disabled={loading || employeeCode.length < 3 || pin.length !== 4} className="w-full h-11 rounded-xl bg-[hsl(var(--primary))] text-white text-[14px] font-medium hover:bg-[hsl(var(--primary))]/90 disabled:opacity-50 active:scale-[0.99] transition-transform grid place-items-center">
+                  {loading ? <Loader2 className="animate-spin" size={16} /> : "Sign in"}
                 </button>
-              ))}
-            </div>
-          </div>
+              </form>
+              <p className="mt-6 text-[12px] text-slate-400 text-center">Don't have an Employee ID? Contact your Super Admin.</p>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-3 mb-6">
+                <div className="w-12 h-12 rounded-xl bg-[hsl(var(--primary))]/10 grid place-items-center">
+                  <ShieldCheck size={22} className="text-[hsl(var(--primary))]" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-semibold tracking-tight text-slate-900">Two-Factor Authentication</h2>
+                  <p className="text-[13px] text-slate-500">Enter the 6-digit code from your authenticator app</p>
+                </div>
+              </div>
+              <form onSubmit={verify2FA} className="space-y-4">
+                <div>
+                  <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">OTP Code</label>
+                  <input value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))} type="text" inputMode="numeric" maxLength={6} placeholder="000000" className="mt-1.5 w-full h-14 rounded-xl border border-slate-200 focus:border-[hsl(var(--primary))] outline-none text-[28px] font-mono tracking-[0.5em] text-center" autoFocus />
+                </div>
+                <button disabled={loading || otp.length !== 6} className="w-full h-11 rounded-xl bg-[hsl(var(--primary))] text-white text-[14px] font-medium hover:bg-[hsl(var(--primary))]/90 disabled:opacity-50 grid place-items-center">
+                  {loading ? <Loader2 className="animate-spin" size={16} /> : "Verify & Sign in"}
+                </button>
+                <button type="button" onClick={() => { setTwoFAMode(false); setOtp(""); }} className="w-full text-[13px] text-slate-400 hover:text-slate-600">← Back to login</button>
+              </form>
+            </>
+          )}
         </motion.div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Plus, FolderKanban, LifeBuoy, FileArchive, ScrollText, Trash2 } from "lucide-react";
 import { motion } from "framer-motion";
 import api, { fmtDate, fmtInr } from "@/lib/glc";
@@ -124,21 +124,42 @@ export function Tasks() {
 export function Tickets() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const ticketFileRef = React.useRef(null);
   const load = () => { setLoading(true); api.get("/tickets").then((r) => setRows(r.data.items || [])).finally(() => setLoading(false)); };
   useEffect(load, []);
   const act = async (r, status) => { await api.put(`/tickets/${r.id}`, { status }); toast.success(status); load(); };
 
+  const uploadTicketFile = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length || !selected) return;
+    setUploading(true);
+    try {
+      for (const f of files) {
+        const fd = new FormData();
+        fd.append("file", f);
+        await api.post(`/documents/upload?category=TICKET-${selected.ticketNo}`, fd, { headers: { "Content-Type": "multipart/form-data" } });
+      }
+      toast.success(`${files.length} file(s) attached to ${selected.ticketNo}`);
+    } catch { toast.error("Upload failed"); }
+    finally { setUploading(false); if (ticketFileRef.current) ticketFileRef.current.value = ""; }
+  };
+
   const columns = [
-    { key: "ticketNo", header: "Ticket", mono: true, render: (r) => <span className="font-medium">{r.ticketNo}</span> },
+    { key: "ticketNo", header: "Ticket", mono: true, render: (r) => <span className="font-medium cursor-pointer text-[hsl(var(--primary))]" onClick={() => setSelected(r)}>{r.ticketNo}</span> },
     { key: "subject", header: "Subject" },
     { key: "customerName", header: "Customer" },
     { key: "priority", header: "Priority", render: (r) => <StatusBadge value={r.priority} /> },
     { key: "status", header: "Status", render: (r) => <StatusBadge value={r.status} /> },
     { key: "assignedTo", header: "Assigned" },
     { key: "actions", header: "", align: "right", render: (r) => (
-        <select onChange={(e) => act(r, e.target.value)} defaultValue={r.status} className="text-[11.5px] px-2 py-1 rounded-md border border-slate-200 bg-white">
-          {["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED"].map((s) => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div className="flex items-center gap-2">
+          <select onChange={(e) => act(r, e.target.value)} defaultValue={r.status} className="text-[11.5px] px-2 py-1 rounded-md border border-slate-200 bg-white">
+            {["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED"].map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <button onClick={() => setSelected(r)} className="text-[11px] px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50">📎 Attach</button>
+        </div>
       )
     },
   ];
@@ -146,6 +167,24 @@ export function Tickets() {
     <div className="space-y-6">
       <PageHeader testId="tickets-page" title="Support Tickets" subtitle="Customer support desk with SLA-driven prioritisation" />
       {(!loading && rows.length === 0) ? <EmptyState icon={LifeBuoy} title="No tickets yet" /> : <DataGrid columns={columns} rows={rows} loading={loading} testId="tickets-grid" />}
+      {selected && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" onClick={() => setSelected(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="font-semibold text-[15px] mb-1">{selected.ticketNo} — {selected.subject}</div>
+            <div className="text-[12px] text-slate-500 mb-4">{selected.customerName} · {selected.status}</div>
+            <p className="text-[13px] text-slate-600 mb-4">{selected.description || "No description"}</p>
+            <div className="border-t border-slate-100 pt-4">
+              <p className="text-[12px] font-medium text-slate-500 mb-2">ATTACHMENTS</p>
+              <input ref={ticketFileRef} type="file" onChange={uploadTicketFile} className="hidden" id="ticket-upload" multiple />
+              <label htmlFor="ticket-upload" className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium cursor-pointer ${uploading ? "bg-slate-200 text-slate-500" : "bg-[hsl(var(--primary))] text-white hover:bg-[hsl(var(--primary))]/90"}`}>
+                {uploading ? "Uploading…" : "📎 Attach Files"}
+              </label>
+              <p className="text-[11px] text-slate-400 mt-2">Files saved in Documents under {selected.ticketNo}</p>
+            </div>
+            <button onClick={() => setSelected(null)} className="mt-4 w-full text-[13px] text-slate-400 hover:text-slate-600">Close</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
