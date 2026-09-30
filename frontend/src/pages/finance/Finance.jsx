@@ -6,6 +6,7 @@ import { PageHeader, DataGrid, StatusBadge, EmptyState, StatCard } from "@/compo
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Field, SelectField } from "@/pages/crm/Leads";
 import { toast } from "sonner";
+import { useCompany } from "@/hooks/useCompany";
 
 export function ChartOfAccounts() {
   const [rows, setRows] = useState([]);
@@ -83,6 +84,7 @@ export function Journal() {
 }
 
 export function GstReports() {
+  const company = useCompany();
   const [data, setData] = useState(null);
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
   const ref = useRef(null);
@@ -111,7 +113,7 @@ export function GstReports() {
         <div className="hidden print:block px-6 pt-6 pb-3 border-b border-slate-200 mb-4">
           <div className="text-[11px] uppercase tracking-wide text-slate-500">GSTR-1 · Outward Supplies</div>
           <div className="text-[22px] font-semibold text-slate-900">Period: {month}</div>
-          <div className="text-[12px] text-slate-500 mt-1">GLC Zone Pvt Ltd · GSTIN 07AABCG1234H1Z5 · New Delhi</div>
+          <div className="text-[12px] text-slate-500 mt-1">GLC Zone Pvt Ltd · GSTIN {company?.gstin} · {company?.state}</div>
         </div>
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
           <StatCard label="Invoices" value={s.count || 0} icon={FileText} tone="primary" />

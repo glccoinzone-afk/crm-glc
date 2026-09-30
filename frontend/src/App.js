@@ -25,6 +25,7 @@ import Attendance from "@/pages/hr/Attendance";
 import Leaves from "@/pages/hr/Leaves";
 import Payroll from "@/pages/hr/Payroll";
 import { ChartOfAccounts, Journal, GstReports, ProfitLoss, Expenses } from "@/pages/finance/Finance";
+import { TrialBalance, GstReturns, ReceivablesAgeing, CreditNotes } from "@/pages/finance/FinanceReports";
 import { Projects, Tasks, Tickets, Documents, AuditLog } from "@/pages/misc/Misc";
 import Settings from "@/pages/Settings";
 import Inbox from "@/pages/ocm/Inbox";
@@ -80,6 +81,10 @@ function AppRoutes() {
       <Route path="/finance/accounts" element={<Guard module="finance.accounts"><ChartOfAccounts /></Guard>} />
       <Route path="/finance/journal" element={<Guard module="finance.journal"><Journal /></Guard>} />
       <Route path="/finance/gst" element={<Guard module="finance.gst"><GstReports /></Guard>} />
+      <Route path="/finance/trial-balance" element={<Guard module="finance.trial"><TrialBalance /></Guard>} />
+      <Route path="/finance/gst-returns" element={<Guard module="finance.gst"><GstReturns /></Guard>} />
+      <Route path="/finance/ageing" element={<Guard module="finance.ageing"><ReceivablesAgeing /></Guard>} />
+      <Route path="/sales/credit-notes" element={<Guard module="sales.invoices"><CreditNotes /></Guard>} />
       <Route path="/finance/pl" element={<Guard module="finance.pl"><ProfitLoss /></Guard>} />
       <Route path="/finance/expenses" element={<Guard module="finance.expenses"><Expenses /></Guard>} />
       <Route path="/projects" element={<Guard module="projects"><Projects /></Guard>} />
