@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta, date
 import os
+import re
 import json
 import uuid
 import asyncio
@@ -17,6 +18,8 @@ import jwt as pyjwt
 import requests
 from pathlib import Path
 from fastapi import UploadFile, File, Response, Header
+from pymongo import ReturnDocument
+import glc_finance as gf
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -115,6 +118,15 @@ async def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)) -> 
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+FINANCE_ROLES = ("Super Admin", "Admin", "Accounts", "Finance Staff")
+
+
+async def finance_user(user=Depends(current_user)) -> Dict[str, Any]:
+    if user.get("role") not in FINANCE_ROLES:
+        raise HTTPException(status_code=403, detail="Finance access required")
     return user
 
 
@@ -530,7 +542,9 @@ class QuoteItem(BaseModel):
     qty: float = 1
     rate: float = 0
     discount: float = 0
+    discountAmount: float = 0
     gstRate: float = 18
+    taxInclusive: bool = False
 
 
 class QuoteIn(BaseModel):
@@ -545,21 +559,9 @@ class QuoteIn(BaseModel):
     vertical: Optional[str] = None
 
 
-def calc_gst(items: List[dict], intra_state: bool = True):
-    subtotal = 0.0
-    cgst = sgst = igst = 0.0
-    for it in items:
-        line = it["qty"] * it["rate"]
-        line -= line * (it.get("discount", 0) / 100)
-        subtotal += line
-        tax = line * (it.get("gstRate", 0) / 100)
-        if intra_state:
-            cgst += tax / 2
-            sgst += tax / 2
-        else:
-            igst += tax
-    total = subtotal + cgst + sgst + igst
-    return {"subtotal": round(subtotal, 2), "cgst": round(cgst, 2), "sgst": round(sgst, 2), "igst": round(igst, 2), "total": round(total, 2)}
+def calc_gst(items: List[dict], intra_state: bool = True, round_off: bool = False):
+    """GST for a list of line items (see glc_finance.calc_gst). Returns subtotal/cgst/sgst/igst/total/roundOff/lines."""
+    return gf.calc_gst(items, intra_state=intra_state, round_off=round_off)
 
 
 @api.get("/quotations")
@@ -570,7 +572,7 @@ async def list_quotes(page: int = 1, limit: int = 50, q: Optional[str] = None, u
 @api.post("/quotations")
 async def create_quote(data: QuoteIn, user=Depends(current_user)):
     items = [i.model_dump() for i in data.items]
-    intra = (data.customerState or "").strip().lower() in ("", "delhi", "dl")
+    intra = gf.is_intra_state(data.customerGst, data.customerState)
     totals = calc_gst(items, intra_state=intra)
     count = await db.quotations.count_documents({})
     doc = {
@@ -598,7 +600,7 @@ async def get_quote(qid: str, user=Depends(current_user)):
 @api.put("/quotations/{qid}")
 async def update_quote(qid: str, data: QuoteIn, user=Depends(current_user)):
     items = [i.model_dump() for i in data.items]
-    intra = (data.customerState or "").strip().lower() in ("", "delhi", "dl")
+    intra = gf.is_intra_state(data.customerGst, data.customerState)
     totals = calc_gst(items, intra_state=intra)
     await db.quotations.update_one({"id": qid}, {"$set": {**data.model_dump(), "items": items, **totals, "updatedAt": now_iso()}})
     d = await db.quotations.find_one({"id": qid}, {"_id": 0})
@@ -947,7 +949,7 @@ async def list_orders(page: int = 1, limit: int = 50, q: Optional[str] = None, s
 @api.post("/orders")
 async def create_order(data: OrderIn, user=Depends(current_user)):
     items = [i.model_dump() for i in data.items]
-    intra = (data.customerState or "").strip().lower() in ("", "delhi", "dl")
+    intra = gf.is_intra_state(data.customerGst, data.customerState)
     totals = calc_gst(items, intra_state=intra)
     count = await db.sales_orders.count_documents({})
     doc = {**data.model_dump(), "id": uid(), "orderNo": f"SO-{datetime.now().year}-{count+1001}", "items": items, **totals, "createdAt": now_iso(), "updatedAt": now_iso()}
@@ -989,7 +991,7 @@ async def current_user_optional(request: Request):
         if not auth.startswith("Bearer "):
             return None
         token = auth.split(" ", 1)[1]
-        return await current_user(token)
+        return await current_user(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token))
     except Exception:
         return None
 
@@ -1019,27 +1021,46 @@ async def generate_invoice(oid: str, request: Request, user=Depends(current_user
     exists = await db.invoices.find_one({"orderId": oid}, {"_id": 0})
     if exists:
         return exists
-    count = await db.invoices.count_documents({})
+    if o.get("glczoneItems"):
+        items = gf.items_from_glczone(o)          # website order: tax, discount and delivery charge as billed
+    else:
+        items = o.get("items") or []
+        if not items and isinstance(o.get("products"), str) and o["products"].strip():
+            paid = float(o.get("finalTotal") or o.get("total") or 0)      # legacy synced order: one line, what was paid
+            items = [{"name": o["products"].strip(), "qty": 1, "rate": paid, "gstRate": 0}]
+    if not items:
+        raise HTTPException(400, "Order has no items to invoice")
+    pos = gf.place_of_supply(o.get("customerGst"), o.get("customerState"))
+    intra = pos == gf.COMPANY_STATE_CODE
+    t = calc_gst(items, intra_state=intra, round_off=True)
+    method = str(o.get("paymentMethod") or "").upper()
+    delivered = str(o.get("glczone_status") or o.get("status") or "").lower() == "delivered"
+    prepaid = str(o.get("paymentStatus") or "").upper() in ("PAID", "SUCCESS", "COMPLETED", "CAPTURED")
+    paid_now = prepaid or (method in ("COD", "CASH") and delivered)      # COD cash is collected at the door
+    inv_no = gf.doc_number("INV", await next_seq("INV"))
     inv = {
         "id": uid(),
-        "invoiceNo": f"INV-{datetime.now().year}-{count+1001}",
+        "invoiceNo": inv_no,
         "orderId": oid,
+        "orderNo": o.get("orderNo"),
         "customerId": o.get("customerId"),
         "customerName": o["customerName"],
         "customerGst": o.get("customerGst"),
-        "customerState": o.get("customerState"),
-        "items": (lambda v, tot: v if isinstance(v, list) else (
-            [{"name": v.strip(), "qty": 1, "price": tot, "rate": tot, "total": tot, "hsn": "", "gst": 0, "amount": tot}]
-            if isinstance(v, str) and v else []
-        ))(o.get("items") or o.get("products"), o.get("finalTotal") or o.get("total") or 0),
-        "subtotal": o.get("subtotal") or o.get("finalTotal") or o.get("total") or 0,
-        "cgst": o.get("cgst") or 0,
-        "sgst": o.get("sgst") or 0,
-        "igst": o.get("igst") or 0,
-        "total": o.get("total") or o.get("finalTotal") or 0,
-        "paidAmount": 0,
-        "dueAmount": o["total"],
-        "status": "UNPAID",
+        "customerState": o.get("customerState") or gf.STATE_CODES.get(pos),
+        "placeOfSupply": f"{pos}-{gf.STATE_CODES.get(pos, '')}",
+        "supplyType": "INTRA" if intra else "INTER",
+        "items": items,
+        "lines": t["lines"],
+        "subtotal": t["subtotal"],
+        "cgst": t["cgst"],
+        "sgst": t["sgst"],
+        "igst": t["igst"],
+        "roundOff": t["roundOff"],
+        "total": t["total"],
+        "paidAmount": t["total"] if paid_now else 0,
+        "creditedAmount": 0,
+        "dueAmount": 0 if paid_now else t["total"],
+        "status": "PAID" if paid_now else "UNPAID",
         "vertical": o.get("vertical"),
         "invoiceDate": now_iso(),
         "dueDate": (datetime.now(timezone.utc) + timedelta(days=15)).isoformat(),
@@ -1047,9 +1068,15 @@ async def generate_invoice(oid: str, request: Request, user=Depends(current_user
         "updatedAt": now_iso(),
     }
     await db.invoices.insert_one(inv)
+    await post_journal(f"Invoice {inv_no}", gf.journal_for_invoice(inv), "INV", inv["id"], user)
+    if paid_now:
+        pay = {"id": uid(), "invoiceId": inv["id"], "customerId": inv.get("customerId"), "amount": t["total"],
+               "method": "CASH" if method in ("COD", "CASH") else (method or "ONLINE"), "reference": f"Auto: {method or 'prepaid'} order {o.get('orderNo') or oid}",
+               "date": now_iso(), "createdAt": now_iso()}
+        await db.payments.insert_one(pay)
+        await post_journal(f"Payment for {inv_no}", gf.journal_for_payment(pay["amount"], pay["method"]), "PAY", pay["id"], user)
     await log_activity(user["id"], "invoices", "generate", inv["id"], {"orderId": oid})
     return clean(inv)
-
 
 # Invoices
 @api.get("/invoices")
@@ -1078,10 +1105,17 @@ class PaymentIn(BaseModel):
 
 
 @api.post("/payments")
-async def add_payment(data: PaymentIn, user=Depends(current_user)):
+async def add_payment(data: PaymentIn, user=Depends(finance_user)):
     inv = await db.invoices.find_one({"id": data.invoiceId}, {"_id": 0})
     if not inv:
         raise HTTPException(404, "Invoice not found")
+    if data.amount <= 0:
+        raise HTTPException(400, "Payment amount must be positive")
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(400, "Invoice is cancelled")
+    due_now = round(inv["total"] - (inv.get("paidAmount") or 0) - (inv.get("creditedAmount") or 0), 2)
+    if data.amount > due_now + 0.01:
+        raise HTTPException(400, f"Payment exceeds the amount due (₹{due_now:,.2f})")
     pay = {
         "id": uid(),
         "invoiceId": data.invoiceId,
@@ -1094,15 +1128,16 @@ async def add_payment(data: PaymentIn, user=Depends(current_user)):
     }
     await db.payments.insert_one(pay)
     new_paid = (inv.get("paidAmount", 0) or 0) + data.amount
-    new_due = max(inv["total"] - new_paid, 0)
+    new_due = max(round(inv["total"] - new_paid - (inv.get("creditedAmount") or 0), 2), 0)
     status_ = "PAID" if new_due <= 0.01 else ("PARTIAL" if new_paid > 0 else "UNPAID")
     await db.invoices.update_one({"id": data.invoiceId}, {"$set": {"paidAmount": new_paid, "dueAmount": new_due, "status": status_, "updatedAt": now_iso()}})
+    await post_journal(f"Payment for {inv.get('invoiceNo')}", gf.journal_for_payment(data.amount, data.method), "PAY", pay["id"], user)
     await log_activity(user["id"], "payments", "create", pay["id"], {"invoiceId": data.invoiceId})
     return clean(pay)
 
 
 @api.get("/payments")
-async def list_payments(page: int = 1, limit: int = 50, user=Depends(current_user)):
+async def list_payments(page: int = 1, limit: int = 50, user=Depends(finance_user)):
     return await paginate(db.payments, {}, page, limit)
 
 
@@ -1286,9 +1321,12 @@ async def list_pos(page: int = 1, limit: int = 50, q: Optional[str] = None, user
 @api.post("/purchase-orders")
 async def create_po(data: POIn, user=Depends(current_user)):
     items = [i.model_dump() for i in data.items]
-    totals = calc_gst(items, intra_state=True)
+    sup = await db.suppliers.find_one({"id": data.supplierId}, {"_id": 0}) or {}
+    intra = gf.is_intra_state(sup.get("gst"), sup.get("state"))
+    totals = calc_gst(items, intra_state=intra)
     count = await db.purchase_orders.count_documents({})
-    doc = {**data.model_dump(), "id": uid(), "poNo": f"PO-{datetime.now().year}-{count+1001}", "items": items, **totals, "createdAt": now_iso(), "updatedAt": now_iso()}
+    doc = {**data.model_dump(), "id": uid(), "poNo": f"PO-{datetime.now().year}-{count+1001}", "items": items, **totals,
+           "supplierGst": sup.get("gst") or "", "itcEligible": gf.valid_gstin(sup.get("gst")), "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.purchase_orders.insert_one(doc)
     return clean(doc)
 
@@ -1297,8 +1335,11 @@ async def create_po(data: POIn, user=Depends(current_user)):
 async def update_po(pid: str, body: Dict[str, Any], user=Depends(current_user)):
     body["updatedAt"] = now_iso()
     # If marking RECEIVED, increment stock
-    if body.get("status") == "RECEIVED":
-        po = await db.purchase_orders.find_one({"id": pid}, {"_id": 0})
+    prev_po = await db.purchase_orders.find_one({"id": pid}, {"_id": 0}) or {}
+    just_received = body.get("status") == "RECEIVED" and prev_po.get("status") != "RECEIVED"
+    if just_received:
+        body["receivedAt"] = now_iso()
+        po = prev_po
         if po:
             for it in po.get("items", []):
                 if it.get("productId"):
@@ -1311,6 +1352,8 @@ async def update_po(pid: str, body: Dict[str, Any], user=Depends(current_user)):
                         await db.stock_items.insert_one({"id": uid(), "productId": it["productId"], "warehouseId": wh_id, "qty": it["qty"], "updatedAt": now_iso()})
     await db.purchase_orders.update_one({"id": pid}, {"$set": body})
     d = await db.purchase_orders.find_one({"id": pid}, {"_id": 0})
+    if just_received and d:
+        await post_journal(f"Goods received {d.get('poNo')}", gf.journal_for_purchase(d), "PO", pid, user)
     return d
 
 
@@ -1521,13 +1564,17 @@ class AccountIn(BaseModel):
 
 
 @api.get("/accounts")
-async def list_accounts(user=Depends(current_user)):
+async def list_accounts(user=Depends(finance_user)):
     items = await db.accounts.find({}, {"_id": 0}).sort("code", 1).to_list(500)
+    journals = await db.journal.find({}, {"_id": 0, "entries": 1}).to_list(100000)
+    bal = {r["id"]: r["balance"] for r in gf.trial_balance(items, journals)["rows"]}
+    for a in items:
+        a["balance"] = bal.get(a["id"], 0)
     return {"items": items}
 
 
 @api.post("/accounts")
-async def create_account(data: AccountIn, user=Depends(current_user)):
+async def create_account(data: AccountIn, user=Depends(finance_user)):
     doc = {**data.model_dump(), "id": uid(), "createdAt": now_iso()}
     await db.accounts.insert_one(doc)
     return clean(doc)
@@ -1546,50 +1593,61 @@ async def list_journal(user=Depends(current_user)):
 
 
 @api.post("/journal")
-async def create_journal(data: JournalIn, user=Depends(current_user)):
+async def create_journal(data: JournalIn, user=Depends(finance_user)):
     total_dr = sum(e.get("debit", 0) for e in data.entries)
     total_cr = sum(e.get("credit", 0) for e in data.entries)
     if round(total_dr, 2) != round(total_cr, 2):
         raise HTTPException(400, "Debit and Credit totals must match")
-    doc = {**data.model_dump(), "id": uid(), "totalDebit": total_dr, "totalCredit": total_cr, "createdAt": now_iso()}
+    ids = {a["id"]: a["code"] async for a in db.accounts.find({}, {"_id": 0, "id": 1, "code": 1})}
+    for e in data.entries:
+        if e.get("accountId") not in ids:
+            raise HTTPException(400, "Unknown account in journal entry")
+        if float(e.get("debit") or 0) < 0 or float(e.get("credit") or 0) < 0:
+            raise HTTPException(400, "Debit/credit cannot be negative")
+        e["accountCode"] = ids[e["accountId"]]
+    doc = {**data.model_dump(), "id": uid(), "refType": "MANUAL", "refId": None, "totalDebit": total_dr, "totalCredit": total_cr,
+           "createdBy": user.get("id"), "createdAt": now_iso()}
     await db.journal.insert_one(doc)
     return clean(doc)
 
 
+def _month_filter(field: str, month: Optional[str]) -> dict:
+    if month and not re.match(r"^\d{4}-\d{2}$", month):
+        raise HTTPException(400, "month must look like 2026-09")
+    return {field: {"$regex": f"^{month}"}} if month else {}
+
+
 @api.get("/reports/gst")
-async def gst_report(month: Optional[str] = None, user=Depends(current_user)):
-    filt = {}
-    if month:
-        filt["invoiceDate"] = {"$regex": f"^{month}"}
-    invoices = await db.invoices.find(filt, {"_id": 0}).to_list(1000)
-    total_taxable = sum(i.get("subtotal", 0) for i in invoices)
-    total_cgst = sum(i.get("cgst", 0) for i in invoices)
-    total_sgst = sum(i.get("sgst", 0) for i in invoices)
-    total_igst = sum(i.get("igst", 0) for i in invoices)
-    total = sum(i.get("total", 0) for i in invoices)
+async def gst_report(month: Optional[str] = None, user=Depends(finance_user)):
+    invoices = await db.invoices.find({**_month_filter("invoiceDate", month), "status": {"$ne": "CANCELLED"}}, {"_id": 0}).to_list(20000)
+    notes = await db.credit_notes.find(_month_filter("noteDate", month), {"_id": 0}).to_list(20000)
+
+    def net(key):
+        return round(sum(i.get(key, 0) or 0 for i in invoices) - sum(c.get(key, 0) or 0 for c in notes), 2)
     return {
         "month": month,
         "invoices": invoices,
+        "creditNotes": notes,
         "summary": {
-            "taxableValue": round(total_taxable, 2),
-            "cgst": round(total_cgst, 2),
-            "sgst": round(total_sgst, 2),
-            "igst": round(total_igst, 2),
-            "total": round(total, 2),
-            "count": len(invoices),
-        }
+            "taxableValue": net("subtotal"), "cgst": net("cgst"), "sgst": net("sgst"), "igst": net("igst"),
+            "total": net("total"), "count": len(invoices), "creditNoteCount": len(notes),
+        },
     }
 
 
 @api.get("/reports/pl")
-async def pl_report(user=Depends(current_user)):
-    revenue = 0.0
-    async for i in db.invoices.find({}, {"_id": 0}):
-        revenue += i.get("subtotal", 0)
+async def pl_report(user=Depends(finance_user)):
+    sales = credits = 0.0
+    async for i in db.invoices.find({"status": {"$ne": "CANCELLED"}}, {"_id": 0, "subtotal": 1}):
+        sales += i.get("subtotal", 0)
+    async for c in db.credit_notes.find({}, {"_id": 0, "subtotal": 1}):
+        credits += c.get("subtotal", 0)
     expenses = 0.0
     async for e in db.expenses.find({"status": "APPROVED"}, {"_id": 0}):
         expenses += e.get("amount", 0)
-    return {"revenue": round(revenue, 2), "expenses": round(expenses, 2), "netProfit": round(revenue - expenses, 2)}
+    revenue = sales - credits            # GST collected is not income, so only the taxable value counts
+    return {"revenue": round(revenue, 2), "grossSales": round(sales, 2), "salesReturns": round(credits, 2),
+            "expenses": round(expenses, 2), "netProfit": round(revenue - expenses, 2)}
 
 
 class ExpenseIn(BaseModel):
@@ -1814,6 +1872,10 @@ async def order_event_webhook(request: Request):
         data["glczoneItems"] = body.get("items")
     if addr_text:
         data["deliveryAddress"] = addr_text
+    if body.get("delivery_charge") is not None:
+        data["deliveryCharge"] = float(body.get("delivery_charge") or 0)
+    if body.get("discount") is not None:
+        data["discount"] = float(body.get("discount") or 0)
     if body.get("ward"):
         data["ward"] = body.get("ward")
     if zone.get("name"):
@@ -3217,25 +3279,21 @@ async def download_invoice_pdf(iid: str, user=Depends(current_user)):
     elems.append(Spacer(1, 4*mm))
 
     # Bill to
-    elems.append(Paragraph(f"<b>Bill To:</b> {d.get('customerName','')} | GST: {d.get('customerGst','-')} | State: {d.get('customerState','-')}", bold))
+    elems.append(Paragraph(f"<b>Bill To:</b> {d.get('customerName','')} | GST: {d.get('customerGst') or '-'} | State: {d.get('customerState') or '-'} | Place of supply: {d.get('placeOfSupply') or '-'}", bold))
     elems.append(Spacer(1, 4*mm))
 
     # Items table
     headers = ["#", "Item", "HSN", "Qty", "Rate (₹)", "GST%", "Amount (₹)"]
     rows = [headers]
-    for i, item in enumerate(d.get("items", []), 1):
-        qty = item.get("qty", 0)
-        rate = item.get("rate", 0)
-        gst = item.get("gstRate", 0)
-        amount = qty * rate * (1 + gst/100)
+    for i, item in enumerate(gf.ensure_lines(d), 1):
         rows.append([
             str(i),
             item.get("name", ""),
             item.get("hsn", ""),
-            str(qty),
-            f"{rate:,.2f}",
-            f"{gst}%",
-            f"{amount:,.2f}",
+            f"{item.get('qty', 0):g}",
+            f"{item.get('rate', 0):,.2f}",
+            f"{item.get('gstRate', 0):g}%",
+            f"{item.get('total', 0):,.2f}",
         ])
 
     item_table = Table(rows, colWidths=[8*mm, 65*mm, 18*mm, 12*mm, 22*mm, 14*mm, 26*mm])
@@ -3261,6 +3319,7 @@ async def download_invoice_pdf(iid: str, user=Depends(current_user)):
         ["", "CGST:", f"₹{d.get('cgst',0):,.2f}"],
         ["", "SGST:", f"₹{d.get('sgst',0):,.2f}"],
         ["", "IGST:", f"₹{d.get('igst',0):,.2f}"],
+        ["", "Round off:", f"₹{d.get('roundOff',0):,.2f}"],
         ["", Paragraph("<b>Total:</b>", bold), Paragraph(f"<b>₹{d.get('total',0):,.2f}</b>", bold)],
         ["", "Paid:", f"₹{d.get('paidAmount',0):,.2f}"],
         ["", Paragraph("<b>Due:</b>", bold), Paragraph(f"<b>₹{d.get('dueAmount',0):,.2f}</b>", bold)],
@@ -3269,8 +3328,8 @@ async def download_invoice_pdf(iid: str, user=Depends(current_user)):
     tot_table.setStyle(TableStyle([
         ("FONTSIZE", (0,0), (-1,-1), 9),
         ("ALIGN", (1,0), (-1,-1), "RIGHT"),
-        ("LINEABOVE", (1,4), (-1,4), 0.5, colors.grey),
-        ("LINEBELOW", (1,6), (-1,6), 0.5, colors.grey),
+        ("LINEABOVE", (1,5), (-1,5), 0.5, colors.grey),
+        ("LINEBELOW", (1,7), (-1,7), 0.5, colors.grey),
     ]))
     elems.append(tot_table)
     elems.append(Spacer(1, 6*mm))
@@ -4329,6 +4388,10 @@ async def startup_seed():
         log.info("Storage initialized")
     except Exception as e:
         log.warning(f"Storage init deferred: {e}")
+    try:
+        await ensure_finance_accounts()
+    except Exception as e:
+        log.warning(f"Finance accounts check failed: {e}")
     asyncio.create_task(scheduled_posts_worker())
     log.info("Scheduled posts worker started")
 
@@ -4336,6 +4399,209 @@ async def startup_seed():
 @app.on_event("shutdown")
 async def shutdown_db():
     client.close()
+
+
+# =========================================================
+# FINANCE: double-entry books, credit notes, GST returns
+# =========================================================
+async def next_seq(prefix: str) -> int:
+    """Atomic per-financial-year counter (no duplicate document numbers under concurrent requests)."""
+    doc = await db.counters.find_one_and_update({"_id": gf.counter_key(prefix)}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+    return int(doc["seq"])
+
+
+async def ensure_finance_accounts():
+    have = {a["code"] async for a in db.accounts.find({}, {"code": 1, "_id": 0})}
+    for code, (name, typ) in gf.REQUIRED_ACCOUNTS.items():
+        if code not in have:
+            await db.accounts.insert_one({"id": uid(), "code": code, "name": name, "type": typ, "balance": 0, "createdAt": now_iso()})
+
+
+async def post_journal(narration: str, entries: List[dict], ref_type: str, ref_id: str, user: Optional[dict] = None):
+    """Posts one balanced journal entry, once per (ref_type, ref_id). Never raises: a bookkeeping problem must not
+    block an invoice or payment; gaps are listed by /finance/books-check and repaired by /finance/backfill-books."""
+    try:
+        if not entries:
+            return None
+        if not gf.check_balanced(entries):
+            log.error(f"journal not balanced, skipped: {narration}")
+            return None
+        if await db.journal.find_one({"refType": ref_type, "refId": ref_id}, {"_id": 0, "id": 1}):
+            return None
+        await ensure_finance_accounts()
+        ids = {a["code"]: a["id"] async for a in db.accounts.find({}, {"code": 1, "id": 1, "_id": 0})}
+        rows = [{"accountId": ids[e["accountCode"]], "accountCode": e["accountCode"], "debit": e["debit"], "credit": e["credit"]} for e in entries]
+        doc = {"id": uid(), "date": datetime.now(timezone.utc).date().isoformat(), "narration": narration, "entries": rows,
+               "totalDebit": round(sum(r["debit"] for r in rows), 2), "totalCredit": round(sum(r["credit"] for r in rows), 2),
+               "refType": ref_type, "refId": ref_id, "createdBy": (user or {}).get("id"), "createdAt": now_iso()}
+        await db.journal.insert_one(doc)
+        return doc
+    except Exception as e:
+        log.exception(f"post_journal failed ({narration}): {e}")
+        return None
+
+
+@api.get("/finance/company")
+async def finance_company(user=Depends(finance_user)):
+    return {"gstin": gf.COMPANY_GSTIN, "gstinValid": gf.valid_gstin(gf.COMPANY_GSTIN), "stateCode": gf.COMPANY_STATE_CODE,
+            "state": gf.STATE_CODES.get(gf.COMPANY_STATE_CODE), "financialYear": gf.fy_label(),
+            "delivery": {"sac": gf.DELIVERY_SAC, "gstRate": gf.DELIVERY_GST_RATE, "taxInclusive": gf.DELIVERY_TAX_INCLUSIVE}}
+
+
+class CreditNoteIn(BaseModel):
+    reason: str = "Sales return"
+    items: Optional[List[Dict[str, Any]]] = None      # [{"index": 0, "qty": 1}]; omit for the whole invoice
+    includeDelivery: bool = False
+
+
+@api.post("/invoices/{iid}/credit-note")
+async def create_credit_note(iid: str, data: CreditNoteIn, user=Depends(finance_user)):
+    inv = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(400, "Invoice is cancelled")
+    prior_qty = inv.get("creditedQty") or {}
+    if data.items is None and (inv.get("creditedAmount") or 0) > 0:
+        raise HTTPException(400, "This invoice already has a credit note; choose the items to credit")
+    try:
+        items = gf.credit_note_items(inv, data.items, data.includeDelivery)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not items:
+        raise HTTPException(400, "Nothing to credit")
+    lines = gf.ensure_lines(inv)
+    for p in data.items or []:
+        idx = str(int(p.get("index", -1)))
+        if float(prior_qty.get(idx, 0)) + float(p.get("qty") or 0) > lines[int(idx)]["qty"] + 1e-9:
+            raise HTTPException(400, "Credit quantity exceeds what was invoiced")
+    intra = (inv.get("supplyType") == "INTRA") if inv.get("supplyType") else gf.is_intra_state(inv.get("customerGst"), inv.get("customerState"))
+    t = calc_gst(items, intra_state=intra, round_off=True)
+    remaining = round(inv["total"] - (inv.get("creditedAmount") or 0), 2)
+    if t["total"] > remaining + 0.01:
+        raise HTTPException(400, f"Credit note (₹{t['total']:,.2f}) exceeds the invoice balance (₹{remaining:,.2f})")
+    note_no = gf.doc_number("CN", await next_seq("CN"))
+    cn = {"id": uid(), "noteNo": note_no, "invoiceId": iid, "invoiceNo": inv.get("invoiceNo"), "customerName": inv.get("customerName"),
+          "customerGst": inv.get("customerGst"), "customerState": inv.get("customerState"), "placeOfSupply": inv.get("placeOfSupply"),
+          "reason": data.reason, "items": items, "lines": t["lines"], "subtotal": t["subtotal"], "cgst": t["cgst"], "sgst": t["sgst"],
+          "igst": t["igst"], "roundOff": t["roundOff"], "total": t["total"], "noteDate": now_iso(), "createdBy": user.get("id"), "createdAt": now_iso()}
+    await db.credit_notes.insert_one(cn)
+    credited = round((inv.get("creditedAmount") or 0) + t["total"], 2)
+    for p in data.items or []:
+        idx = str(int(p["index"]))
+        prior_qty[idx] = float(prior_qty.get(idx, 0)) + float(p["qty"])
+    if data.items is None:
+        for i, l in enumerate(lines):
+            if not l.get("isDelivery") or data.includeDelivery:
+                prior_qty[str(i)] = l["qty"]
+    net_due = round(inv["total"] - credited, 2)
+    paid = inv.get("paidAmount") or 0
+    due = max(round(net_due - paid, 2), 0)
+    status_ = "CREDITED" if net_due <= 0.01 else ("PAID" if due <= 0.01 else ("PARTIAL" if paid > 0 else "UNPAID"))
+    await db.invoices.update_one({"id": iid}, {"$set": {"creditedAmount": credited, "creditedQty": prior_qty, "dueAmount": due,
+                                                        "refundDue": max(round(paid - net_due, 2), 0), "status": status_, "updatedAt": now_iso()}})
+    await post_journal(f"Credit note {note_no} against {inv.get('invoiceNo')}", gf.journal_for_credit_note(cn), "CN", cn["id"], user)
+    await log_activity(user["id"], "credit_notes", "create", cn["id"], {"invoiceId": iid})
+    return clean(cn)
+
+
+@api.get("/credit-notes")
+async def list_credit_notes(page: int = 1, limit: int = 50, q: Optional[str] = None, user=Depends(finance_user)):
+    return await paginate(db.credit_notes, {}, page, limit, search_fields=["noteNo", "invoiceNo", "customerName"], q=q)
+
+
+@api.post("/invoices/{iid}/cancel")
+async def cancel_invoice(iid: str, user=Depends(finance_user)):
+    inv = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    if inv.get("status") != "UNPAID" or (inv.get("paidAmount") or 0) > 0 or (inv.get("creditedAmount") or 0) > 0:
+        raise HTTPException(400, "Only an unpaid invoice with no credit note can be cancelled; otherwise issue a credit note")
+    await db.invoices.update_one({"id": iid}, {"$set": {"status": "CANCELLED", "dueAmount": 0, "cancelledAt": now_iso(), "updatedAt": now_iso()}})
+    rev = [{"accountCode": e["accountCode"], "debit": e["credit"], "credit": e["debit"]} for e in gf.journal_for_invoice({**inv, "lines": gf.ensure_lines(inv)})]
+    await post_journal(f"Cancelled invoice {inv.get('invoiceNo')}", rev, "INV_CANCEL", iid, user)
+    await log_activity(user["id"], "invoices", "cancel", iid)
+    return {"ok": True}
+
+
+@api.get("/finance/trial-balance")
+async def finance_trial_balance(user=Depends(finance_user)):
+    accts = await db.accounts.find({}, {"_id": 0}).to_list(500)
+    journals = await db.journal.find({}, {"_id": 0, "entries": 1}).to_list(100000)
+    return gf.trial_balance(accts, journals)
+
+
+@api.get("/finance/ledger/{code}")
+async def finance_ledger(code: str, user=Depends(finance_user)):
+    acct = await db.accounts.find_one({"code": code}, {"_id": 0})
+    if not acct:
+        raise HTTPException(404, "Account not found")
+    journals = await db.journal.find({"entries.accountId": acct["id"]}, {"_id": 0}).to_list(100000)
+    return gf.ledger(acct, journals)
+
+
+@api.get("/finance/receivables-ageing")
+async def finance_ageing(user=Depends(finance_user)):
+    invs = await db.invoices.find({"status": {"$in": ["UNPAID", "PARTIAL"]}}, {"_id": 0}).to_list(20000)
+    return gf.receivables_ageing(invs)
+
+
+@api.get("/reports/gstr1")
+async def report_gstr1(month: Optional[str] = None, user=Depends(finance_user)):
+    invs = await db.invoices.find(_month_filter("invoiceDate", month), {"_id": 0}).to_list(50000)
+    notes = await db.credit_notes.find(_month_filter("noteDate", month), {"_id": 0}).to_list(50000)
+    return {"month": month, "gstin": gf.COMPANY_GSTIN, **gf.gstr1(invs, notes)}
+
+
+@api.get("/reports/gstr3b")
+async def report_gstr3b(month: Optional[str] = None, user=Depends(finance_user)):
+    invs = await db.invoices.find(_month_filter("invoiceDate", month), {"_id": 0}).to_list(50000)
+    notes = await db.credit_notes.find(_month_filter("noteDate", month), {"_id": 0}).to_list(50000)
+    pos = await db.purchase_orders.find({"status": "RECEIVED", **_month_filter("receivedAt", month)}, {"_id": 0}).to_list(50000)
+    return {"month": month, "gstin": gf.COMPANY_GSTIN, **gf.gstr3b(invs, notes, pos),
+            "note": "Draft for the accountant: check ITC eligibility (blocked credits, supplier filing) and reverse-charge items before filing."}
+
+
+@api.get("/finance/books-check")
+async def finance_books_check(user=Depends(finance_user)):
+    """Which invoices / payments / credit notes / received POs have no journal entry yet."""
+    have = {(j["refType"], j["refId"]) async for j in db.journal.find({"refType": {"$in": ["INV", "PAY", "CN", "PO"]}}, {"_id": 0, "refType": 1, "refId": 1})}
+    missing = {
+        "invoices": [i.get("invoiceNo") async for i in db.invoices.find({"status": {"$ne": "CANCELLED"}}, {"_id": 0, "id": 1, "invoiceNo": 1}) if ("INV", i["id"]) not in have],
+        "payments": [p["id"] async for p in db.payments.find({}, {"_id": 0, "id": 1}) if ("PAY", p["id"]) not in have],
+        "creditNotes": [c.get("noteNo") async for c in db.credit_notes.find({}, {"_id": 0, "id": 1, "noteNo": 1}) if ("CN", c["id"]) not in have],
+        "purchaseOrders": [p.get("poNo") async for p in db.purchase_orders.find({"status": "RECEIVED"}, {"_id": 0, "id": 1, "poNo": 1}) if ("PO", p["id"]) not in have],
+    }
+    return {"missing": missing, "allPosted": not any(missing.values())}
+
+
+@api.post("/finance/backfill-books")
+async def finance_backfill_books(user=Depends(finance_user)):
+    """Posts the missing journal entries for documents created before auto-posting existed (safe to repeat)."""
+    await ensure_finance_accounts()
+    posted = {"invoices": 0, "payments": 0, "creditNotes": 0, "purchaseOrders": 0}
+    async for inv in db.invoices.find({}, {"_id": 0}):
+        if inv.get("status") == "CANCELLED":
+            continue
+        lines = gf.ensure_lines(inv)
+        inv2 = {**inv, "lines": lines}
+        entries = gf.journal_for_invoice(inv2)
+        if not gf.check_balanced(entries):      # old invoice whose lines do not add up to its stored total
+            taxes = round((inv.get("cgst") or 0) + (inv.get("sgst") or 0) + (inv.get("igst") or 0), 2)
+            entries = gf._entries([("1300", inv["total"], 0), ("4100", 0, round(inv["total"] - taxes, 2)),
+                                   ("2210", 0, inv.get("cgst", 0)), ("2220", 0, inv.get("sgst", 0)), ("2230", 0, inv.get("igst", 0))])
+        if await post_journal(f"Invoice {inv.get('invoiceNo')} (backfill)", entries, "INV", inv["id"], user):
+            posted["invoices"] += 1
+    async for pay in db.payments.find({}, {"_id": 0}):
+        if await post_journal(f"Payment (backfill) {pay.get('reference') or ''}".strip(), gf.journal_for_payment(pay["amount"], pay.get("method")), "PAY", pay["id"], user):
+            posted["payments"] += 1
+    async for cn in db.credit_notes.find({}, {"_id": 0}):
+        if await post_journal(f"Credit note {cn.get('noteNo')} (backfill)", gf.journal_for_credit_note(cn), "CN", cn["id"], user):
+            posted["creditNotes"] += 1
+    async for po in db.purchase_orders.find({"status": "RECEIVED"}, {"_id": 0}):
+        if await post_journal(f"Goods received {po.get('poNo')} (backfill)", gf.journal_for_purchase(po), "PO", po["id"], user):
+            posted["purchaseOrders"] += 1
+    return {"posted": posted}
 
 
 @api.get("/")
