@@ -268,6 +268,7 @@ async def auth_sso(role: str, employee_code: str, name: str, exp: str, sig: str)
         "Super Admin", "Admin", "Manager", "Catalog Manager", "Logistics Manager",
         "Warehouse Manager", "Seller Relations Manager", "Telecaller",
         "Finance Staff", "Marketing Manager", "System Admin",
+        "Support Executive", "Sales", "HR", "Accounts",
     )
     if role not in valid_sso_roles:
         raise HTTPException(403, "Role not permitted")
