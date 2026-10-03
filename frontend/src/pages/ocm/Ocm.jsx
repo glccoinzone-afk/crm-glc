@@ -60,18 +60,24 @@ export function Broadcasts() {
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ name: "", channels: ["TELEGRAM"], audience: "ALL", message: "", status: "DRAFT" });
+  const [sending, setSending] = useState({});
   const load = () => { setLoading(true); api.get("/ocm/broadcasts").then((r) => setRows(r.data.items || [])).finally(() => setLoading(false)); };
   useEffect(load, []);
   const save = async () => { if (!form.name || !form.message) return toast.error("Name & message required"); await api.post("/ocm/broadcasts", form); toast.success("Broadcast saved"); setOpen(false); load(); };
   const send = async (r) => {
-    const res = await api.post(`/ocm/broadcasts/${r.id}/send`);
-    const { sent = 0, failed = 0 } = res.data || {};
-    if (failed > 0) {
-      toast.success(`Sent to ${sent}, ${failed} failed`);
-    } else {
-      toast.success(`Sent to ${sent} contacts`);
+    if (sending[r.id]) return;
+    setSending((m) => ({ ...m, [r.id]: true }));
+    try {
+      const res = await api.post(`/ocm/broadcasts/${r.id}/send`);
+      const { sent = 0, failed = 0 } = res.data || {};
+      if (failed > 0) toast.error(`Sent to ${sent}, ${failed} failed - see Failed column`);
+      else toast.success(`Sent to ${sent} contacts`);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Send failed");
+    } finally {
+      setSending((m) => ({ ...m, [r.id]: false }));
+      load();
     }
-    load();
   };
   const toggleCh = (c) => { const has = form.channels.includes(c); setForm({ ...form, channels: has ? form.channels.filter((x) => x !== c) : [...form.channels, c] }); };
 
@@ -85,11 +91,17 @@ export function Broadcasts() {
     },
     { key: "status", header: "Status", render: (r) => <StatusBadge value={r.status} /> },
     { key: "sentCount", header: "Sent", mono: true, align: "right" },
-    { key: "deliveredCount", header: "Delivered", mono: true, align: "right" },
+    { key: "deliveredCount", header: "Accepted", mono: true, align: "right" },
+    { key: "failedCount", header: "Failed", mono: true, align: "right", render: (r) => (
+        <span title={(r.failureReasons || []).map((f) => `${f.count} x ${f.reason}`).join("\n")} className={r.failedCount > 0 ? "text-red-600 font-medium" : ""}>{r.failedCount ?? 0}</span>
+      )
+    },
     { key: "readCount", header: "Read", mono: true, align: "right" },
-    { key: "actions", header: "", align: "right", render: (r) => r.status !== "SENT" ? (
+    { key: "actions", header: "", align: "right", render: (r) => r.status === "SENDING" || sending[r.id] ? (
+        <span className="text-[11px] text-slate-500">Sending...</span>
+      ) : r.status !== "SENT" ? (
         <button data-testid={`broadcast-send-${r.id}`} onClick={() => send(r)} className="text-[11.5px] font-medium text-[hsl(var(--primary))] hover:underline">Send now</button>
-      ) : <span className="text-[11px] text-emerald-600">Delivered</span>
+      ) : <span className="text-[11px] text-emerald-600">Sent</span>
     },
   ];
 
