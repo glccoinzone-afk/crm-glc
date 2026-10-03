@@ -2595,8 +2595,15 @@ async def ocm_create_broadcast(data: BroadcastIn, user=Depends(current_user)):
 @api.post("/ocm/broadcasts/{bid}/send")
 async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
     """Sends the broadcast message on each selected channel to all subscribed contacts that have that channel's contact id."""
-    b = await db.ocm_broadcasts.find_one({"id": bid}, {"_id": 0})
+    # claim the broadcast atomically so a double click / retry can't send it twice
+    b = await db.ocm_broadcasts.find_one_and_update(
+        {"id": bid, "status": {"$nin": ["SENT", "SENDING"]}},
+        {"$set": {"status": "SENDING"}},
+        projection={"_id": 0},
+    )
     if not b:
+        if await db.ocm_broadcasts.find_one({"id": bid}, {"_id": 1}):
+            raise HTTPException(409, "This broadcast is already sent or being sent")
         raise HTTPException(404, "Not found")
 
     channels = b.get("channels") or ["TELEGRAM"]
@@ -2606,6 +2613,22 @@ async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
     sent_count = 0
     failed_count = 0
     seen_recipients = set()
+    failure_reasons = {}
+
+    def send_error(result: dict) -> str:
+        """Real reason a send failed: our own error, else the provider's error message/code."""
+        if result.get("error"):
+            return str(result["error"])[:200]
+        resp = result.get("response")
+        err = resp.get("error") if isinstance(resp, dict) else None
+        if isinstance(err, dict):
+            return f"({err.get('code')}) {err.get('message')}"[:200]
+        return (str(resp)[:200] if resp else "unknown error")
+
+    def note_failure(result: dict) -> str:
+        reason = send_error(result)
+        failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+        return reason
 
     for channel in channels:
         field = CHANNEL_CONTACT_FIELD.get(channel)
@@ -2640,7 +2663,7 @@ async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
                 sent_count += 1
             else:
                 failed_count += 1
-                log.warning(f"Broadcast {bid}: failed to send to {recipient} via {channel}: {result.get('error')}")
+                log.warning(f"Broadcast {bid}: failed to send to {recipient} via {channel}: {note_failure(result)}")
 
         # Also reach GlcZone e-commerce customers directly by phone (WhatsApp only for now)
         if channel == "WHATSAPP":
@@ -2672,8 +2695,7 @@ async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
                     sent_count += 1
                 else:
                     failed_count += 1
-                    err = result.get("error")
-                    log.warning(f"Broadcast {bid}: failed to send to GlcZone customer {recipient}: {err}")
+                    log.warning(f"Broadcast {bid}: failed to send to GlcZone customer {recipient}: {note_failure(result)}")
 
     await db.ocm_broadcasts.update_one(
         {"id": bid},
@@ -2684,6 +2706,7 @@ async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
             "failedCount": failed_count,
             "deliveredCount": sent_count,
             "readCount": 0,
+            "failureReasons": [{"reason": k, "count": v} for k, v in sorted(failure_reasons.items(), key=lambda kv: -kv[1])[:5]],
         }}
     )
     await log_activity(user["id"], "ocm.broadcasts", "send", bid, {"channels": channels, "sent": sent_count, "failed": failed_count})
