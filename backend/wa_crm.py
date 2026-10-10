@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 
@@ -30,6 +30,17 @@ GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
 STOP_WORDS = {"stop", "unsubscribe", "optout", "opt out", "cancel"}
 STATUS_RANK = {"QUEUED": 0, "SENT": 1, "DELIVERED": 2, "READ": 3}
 TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY", "AUTHENTICATION")
+MAX_MEDIA_BYTES = 16 * 1024 * 1024
+MEDIA_TYPES = {  # extension -> (header format, mime) as WhatsApp accepts them
+    ".jpg": ("IMAGE", "image/jpeg"), ".jpeg": ("IMAGE", "image/jpeg"), ".png": ("IMAGE", "image/png"),
+    ".mp4": ("VIDEO", "video/mp4"), ".3gp": ("VIDEO", "video/3gpp"),
+    ".pdf": ("DOCUMENT", "application/pdf"),
+}
+
+
+def media_kind(filename: str) -> Optional[Tuple[str, str]]:
+    """(HEADER format, mime type) for an uploaded file name, or None when WhatsApp cannot use it."""
+    return MEDIA_TYPES.get(os.path.splitext(filename or "")[1].lower())
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -156,7 +167,12 @@ def build_template_create_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Add a sample value for each of the {n} variables")
     components: List[Dict[str, Any]] = []
     header = (data.get("header") or "").strip()
-    if header:
+    header_format = (data.get("headerFormat") or "TEXT").upper()
+    if header_format in ("IMAGE", "VIDEO", "DOCUMENT"):
+        if not data.get("headerHandle"):
+            raise ValueError(f"Upload a sample {header_format.lower()} for the header")
+        components.append({"type": "HEADER", "format": header_format, "example": {"header_handle": [data["headerHandle"]]}})
+    elif header:
         if len(header) > 60:
             raise ValueError("Header can be at most 60 characters")
         components.append({"type": "HEADER", "format": "TEXT", "text": header})
@@ -187,13 +203,23 @@ def build_template_create_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": name, "language": data.get("language") or "en", "category": category, "components": components}
 
 
-def build_template_send_payload(to: str, name: str, language: str, params: List[str]) -> Dict[str, Any]:
+def build_template_send_payload(to: str, name: str, language: str, params: List[str], header_media: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """header_media: {"format": "IMAGE"|"VIDEO"|"DOCUMENT", "id": "<WhatsApp media id>", "filename": optional for documents}."""
     payload: Dict[str, Any] = {
         "messaging_product": "whatsapp", "to": to, "type": "template",
         "template": {"name": name, "language": {"code": language or "en"}},
     }
+    components: List[Dict[str, Any]] = []
+    if header_media:
+        kind = header_media["format"].lower()
+        media: Dict[str, Any] = {"id": header_media["id"]}
+        if kind == "document" and header_media.get("filename"):
+            media["filename"] = header_media["filename"]
+        components.append({"type": "header", "parameters": [{"type": kind, kind: media}]})
     if params:
-        payload["template"]["components"] = [{"type": "body", "parameters": [{"type": "text", "text": clean_param(p)} for p in params]}]
+        components.append({"type": "body", "parameters": [{"type": "text", "text": clean_param(p)} for p in params]})
+    if components:
+        payload["template"]["components"] = components
     return payload
 
 
@@ -260,6 +286,79 @@ def verify_meta_signature(raw: bytes, header: str, secret: str) -> bool:
     return hmac.compare_digest(expected, header or "")
 
 
+# ------------------------------------------------------------------ Meta media (sync; callers use asyncio.to_thread)
+MEDIA_DIR = os.environ.get("CRM_MEDIA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads_wa")
+
+
+def _meta_err(r: requests.Response) -> str:
+    try:
+        e = r.json().get("error", {})
+        return e.get("error_user_msg") or e.get("message") or r.text[:200]
+    except Exception:
+        return r.text[:200]
+
+
+def meta_upload_media(token: str, phone_id: str, path: str, mime: str) -> str:
+    """Upload a local file to WhatsApp and return its media id (valid for about 30 days). Raises RuntimeError with Meta's reason."""
+    with open(path, "rb") as fh:
+        r = requests.post(f"{GRAPH}/{phone_id}/media", headers={"Authorization": f"Bearer {token}"},
+                          data={"messaging_product": "whatsapp", "type": mime},
+                          files={"file": (os.path.basename(path), fh, mime)}, timeout=120)
+    if not r.ok:
+        raise RuntimeError(_meta_err(r))
+    return r.json()["id"]
+
+
+def meta_resumable_handle(token: str, path: str, mime: str) -> str:
+    """Header sample handle for template creation (Meta Resumable Upload API). Raises RuntimeError with Meta's reason."""
+    dbg = requests.get(f"{GRAPH}/debug_token", params={"input_token": token, "access_token": token}, timeout=20)
+    app_id = (dbg.json().get("data") or {}).get("app_id") if dbg.ok else None
+    if not app_id:
+        raise RuntimeError("Could not find the Meta app id for this token")
+    size = os.path.getsize(path)
+    start = requests.post(f"{GRAPH}/{app_id}/uploads", params={"file_length": size, "file_type": mime, "file_name": os.path.basename(path), "access_token": token}, timeout=30)
+    if not start.ok:
+        raise RuntimeError(_meta_err(start))
+    with open(path, "rb") as fh:
+        up = requests.post(f"{GRAPH}/{start.json()['id']}", headers={"Authorization": f"OAuth {token}", "file_offset": "0"}, data=fh.read(), timeout=180)
+    if not up.ok or not up.json().get("h"):
+        raise RuntimeError(_meta_err(up))
+    return up.json()["h"]
+
+
+def meta_send_media(token: str, phone_id: str, to: str, fmt: str, media_id: str, caption: str = "", filename: str = "") -> Dict[str, Any]:
+    """Send an image/video/document inside the 24-hour window (used by chatbot flows and the inbox)."""
+    kind = fmt.lower()
+    body: Dict[str, Any] = {"id": media_id}
+    if caption:
+        body["caption"] = caption
+    if kind == "document" and filename:
+        body["filename"] = filename
+    r = requests.post(f"{GRAPH}/{phone_id}/messages", headers={"Authorization": f"Bearer {token}"},
+                      json={"messaging_product": "whatsapp", "to": to, "type": kind, kind: body}, timeout=30)
+    if r.ok:
+        return {"success": True, "id": ((r.json().get("messages") or [{}])[0]).get("id")}
+    return {"success": False, "error": _meta_err(r)}
+
+
+_media_id_cache: Dict[str, Tuple[str, float]] = {}
+
+
+def cached_media_id(token: str, phone_id: str, path: str, mime: str, ttl: float = 25 * 24 * 3600) -> str:
+    """WhatsApp media ids last ~30 days; reuse one for 25 days per file instead of uploading for every message."""
+    import time
+    hit = _media_id_cache.get(path)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    mid = meta_upload_media(token, phone_id, path, mime)
+    _media_id_cache[path] = (mid, time.time())
+    return mid
+
+
+def media_file_path(doc: Dict[str, Any]) -> str:
+    return os.path.join(MEDIA_DIR, doc["stored"])
+
+
 # ------------------------------------------------------------------ request models
 class TemplateIn(BaseModel):
     name: str
@@ -270,6 +369,8 @@ class TemplateIn(BaseModel):
     footer: Optional[str] = None
     examples: List[str] = []
     buttons: List[Dict[str, Any]] = []
+    headerFormat: str = "TEXT"
+    headerMediaId: Optional[str] = None
 
 
 class ImportIn(BaseModel):
@@ -297,6 +398,7 @@ class CampaignIn(BaseModel):
     segment: Dict[str, Any] = {}
     segmentId: Optional[str] = None
     scheduledAt: Optional[str] = None
+    mediaFileId: Optional[str] = None
 
 
 class CannedIn(BaseModel):
@@ -394,7 +496,8 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
             url = re.sub(r"^https://graph\.facebook\.com/v[\d.]+/", "", nxt)
         for t in items:
             body = next((x.get("text", "") for x in t.get("components", []) if x.get("type") == "BODY"), "")
-            t.update({"id": t.get("id") or t["name"], "body": body, "paramCount": template_param_count(body), "syncedAt": now_iso()})
+            head = next((x for x in t.get("components", []) if x.get("type") == "HEADER"), {})
+            t.update({"id": t.get("id") or t["name"], "body": body, "paramCount": template_param_count(body), "headerFormat": head.get("format", "NONE"), "syncedAt": now_iso()})
             await db.ocm_wa_templates.update_one({"name": t["name"], "language": t.get("language")}, {"$set": t}, upsert=True)
         names = {(t["name"], t.get("language")) for t in items}
         for old in cached:
@@ -402,11 +505,39 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
                 await db.ocm_wa_templates.delete_one({"name": old["name"], "language": old.get("language")})
         return {"items": sorted(items, key=lambda t: t["name"]), "live": True}
 
+    @api.post("/ocm/wa/media")
+    async def wa_upload_media(file: UploadFile = File(...), user=Depends(current_user)):
+        kind = media_kind(file.filename or "")
+        if not kind:
+            raise HTTPException(400, "Use a JPG or PNG image, an MP4 video, or a PDF")
+        data = await file.read()
+        if len(data) > MAX_MEDIA_BYTES:
+            raise HTTPException(400, "File is too large (16 MB maximum)")
+        if kind[0] == "IMAGE" and len(data) > 5 * 1024 * 1024:
+            raise HTTPException(400, "WhatsApp images can be at most 5 MB")
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        fid = uid()
+        stored = fid + os.path.splitext(file.filename)[1].lower()
+        with open(os.path.join(MEDIA_DIR, stored), "wb") as fh:
+            fh.write(data)
+        doc = {"id": fid, "filename": file.filename, "stored": stored, "format": kind[0], "mime": kind[1], "size": len(data), "createdAt": now_iso(), "createdBy": user["name"]}
+        await db.ocm_media.insert_one(dict(doc))
+        return doc
+
     @api.post("/ocm/wa/templates")
     async def wa_create_template(body: TemplateIn, user=Depends(current_user)):
         c = await need_waba()
+        data = body.model_dump()
+        if body.headerFormat.upper() in ("IMAGE", "VIDEO", "DOCUMENT"):
+            media = await db.ocm_media.find_one({"id": body.headerMediaId or ""}, {"_id": 0})
+            if not media or media["format"] != body.headerFormat.upper():
+                raise HTTPException(400, f"Upload a sample {body.headerFormat.lower()} for the header")
+            try:
+                data["headerHandle"] = await asyncio.to_thread(meta_resumable_handle, c["token"], media_file_path(media), media["mime"])
+            except RuntimeError as e:
+                raise HTTPException(400, f"Could not upload the sample: {e}")
         try:
-            payload = build_template_create_payload(body.model_dump())
+            payload = build_template_create_payload(data)
         except ValueError as e:
             raise HTTPException(400, str(e))
         r = await graph("POST", f"{c['wabaId']}/message_templates", c["token"], json=payload)
@@ -524,11 +655,11 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
         filt["phone"] = {"$nin": [None, ""]}
         return await db.ocm_contacts.find(filt, {"_id": 0}).to_list(20000)
 
-    async def send_template(conf: Dict[str, str], to: str, name: str, lang: str, params: List[str]) -> Dict[str, Any]:
+    async def send_template(conf: Dict[str, str], to: str, name: str, lang: str, params: List[str], header_media: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         if not conf["token"] or not conf["phoneId"]:
             return {"ok": False, "error": "WhatsApp credentials are not configured"}
         try:
-            r = await graph("POST", f"{conf['phoneId']}/messages", conf["token"], json=build_template_send_payload(to, name, lang, params))
+            r = await graph("POST", f"{conf['phoneId']}/messages", conf["token"], json=build_template_send_payload(to, name, lang, params, header_media))
         except Exception as e:  # network error
             return {"ok": False, "error": str(e)[:200]}
         if r.ok:
@@ -545,12 +676,23 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
         tpl = await db.ocm_wa_templates.find_one({"name": camp["templateName"], "language": camp.get("language")}, {"_id": 0}) or {}
         sent = failed = 0
         reasons: Dict[str, int] = {}
+        header_media = None
+        if camp.get("mediaFileId"):
+            media = await db.ocm_media.find_one({"id": camp["mediaFileId"]}, {"_id": 0})
+            try:
+                if not media:
+                    raise RuntimeError("The campaign media file is missing")
+                mid = await asyncio.to_thread(meta_upload_media, conf["token"], conf["phoneId"], media_file_path(media), media["mime"])
+                header_media = {"format": media["format"], "id": mid, "filename": media["filename"]}
+            except Exception as e:
+                await db.ocm_campaigns.update_one({"id": cid}, {"$set": {"status": "FAILED", "finishedAt": now_iso(), "audienceSize": len(people), "failureReasons": [{"reason": f"Media upload failed: {e}", "count": len(people)}]}})
+                return {"ok": True, "sent": 0, "failed": len(people)}
         for p in people:
             to = normalize_phone(p.get("phone"))
             if not to:
                 continue
             params = fill_params(camp.get("params") or [], p)
-            res = await send_template(conf, to, camp["templateName"], camp.get("language") or "en", params)
+            res = await send_template(conf, to, camp["templateName"], camp.get("language") or "en", params, header_media)
             await db.ocm_wa_messages.insert_one({
                 "id": uid(), "campaignId": cid, "contactId": p.get("id"), "to": to, "waMessageId": res.get("id"),
                 "status": "SENT" if res["ok"] else "FAILED", "error": res.get("error", ""), "createdAt": now_iso(),
@@ -600,6 +742,13 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
         need = tpl.get("paramCount", 0)
         if len(body.params) < need:
             raise HTTPException(400, f"This template needs {need} variable(s)")
+        head = tpl.get("headerFormat", "NONE")
+        if head in ("IMAGE", "VIDEO", "DOCUMENT"):
+            media = await db.ocm_media.find_one({"id": body.mediaFileId or ""}, {"_id": 0})
+            if not media or media["format"] != head:
+                raise HTTPException(400, f"This template needs a {head.lower()} in its header. Upload one.")
+        elif body.mediaFileId:
+            raise HTTPException(400, "This template has no media header; remove the file")
         scheduled = body.scheduledAt or None
         if scheduled:
             try:
