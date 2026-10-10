@@ -29,7 +29,12 @@ import { TrialBalance, GstReturns, ReceivablesAgeing, CreditNotes } from "@/page
 import { Projects, Tasks, Tickets, Documents, AuditLog } from "@/pages/misc/Misc";
 import Settings from "@/pages/Settings";
 import Inbox from "@/pages/ocm/Inbox";
-import { OcmContacts, Broadcasts, Flows, SocialScheduler, ContentCalendar } from "@/pages/ocm/Ocm";
+import { Broadcasts, Flows, SocialScheduler, ContentCalendar } from "@/pages/ocm/Ocm";
+import WaOverview from "@/pages/ocm/wa/WaOverview";
+import WaTemplates from "@/pages/ocm/wa/WaTemplates";
+import WaCampaigns from "@/pages/ocm/wa/WaCampaigns";
+import WaContacts from "@/pages/ocm/wa/WaContacts";
+import WaLinks from "@/pages/ocm/wa/WaLinks";
 import SellerManagement from "@/pages/seller/SellerManagement";
 import { EmptyState } from "@/components/common/GlcUI";
 import { Lock } from "lucide-react";
@@ -91,8 +96,12 @@ function AppRoutes() {
       <Route path="/tasks" element={<Guard module="tasks"><Tasks /></Guard>} />
       <Route path="/tickets" element={<Guard module="tickets"><Tickets /></Guard>} />
       <Route path="/documents" element={<Guard module="documents"><Documents /></Guard>} />
+      <Route path="/ocm/whatsapp" element={<Guard module="ocm.whatsapp"><WaOverview /></Guard>} />
+      <Route path="/ocm/templates" element={<Guard module="ocm.templates"><WaTemplates /></Guard>} />
+      <Route path="/ocm/campaigns" element={<Guard module="ocm.campaigns"><WaCampaigns /></Guard>} />
+      <Route path="/ocm/links" element={<Guard module="ocm.links"><WaLinks /></Guard>} />
       <Route path="/ocm/inbox" element={<Guard module="ocm.inbox"><Inbox /></Guard>} />
-      <Route path="/ocm/contacts" element={<Guard module="ocm.contacts"><OcmContacts /></Guard>} />
+      <Route path="/ocm/contacts" element={<Guard module="ocm.contacts"><WaContacts /></Guard>} />
       <Route path="/ocm/broadcasts" element={<Guard module="ocm.broadcasts"><Broadcasts /></Guard>} />
       <Route path="/ocm/flows" element={<Guard module="ocm.flows"><Flows /></Guard>} />
       <Route path="/ocm/social" element={<Guard module="ocm.social"><SocialScheduler /></Guard>} />
