@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Users, UserSquare2, Kanban, FileText, ShoppingCart, Receipt,
   Package, Warehouse, Truck, Building2, ClipboardList, UserRound, CalendarClock,
   Wallet, BarChart3, FolderKanban, LifeBuoy, FileArchive, Settings2, ScrollText,
-  Sparkles, BookOpen, Search, ChevronDown, MessageSquare, Megaphone, Bot, Send, CalendarDays, TrendingUp, Store, MessageCircle, Link2
+  Sparkles, BookOpen, Plug, PieChart, Search, ChevronDown, MessageSquare, Megaphone, Bot, Send, CalendarDays, TrendingUp, Store, MessageCircle, Link2
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { canAccess } from "@/lib/rbac";
@@ -49,6 +49,7 @@ const groups = [
   {
     label: "Omnichannel",
     items: [
+      { to: "/ocm/channels", label: "Channels", icon: Plug, mod: "ocm.channels" },
       { to: "/ocm/whatsapp", label: "WhatsApp", icon: MessageCircle, mod: "ocm.whatsapp" },
       { to: "/ocm/inbox", label: "Inbox", icon: MessageSquare, mod: "ocm.inbox" },
       { to: "/ocm/contacts", label: "Contacts", icon: Users, mod: "ocm.contacts" },
@@ -56,6 +57,7 @@ const groups = [
       { to: "/ocm/campaigns", label: "Campaigns", icon: Megaphone, mod: "ocm.campaigns" },
       { to: "/ocm/broadcasts", label: "Quick Broadcast", icon: Send, mod: "ocm.broadcasts" },
       { to: "/ocm/links", label: "Short Links", icon: Link2, mod: "ocm.links" },
+      { to: "/ocm/reports", label: "Reports", icon: PieChart, mod: "ocm.reports" },
       { to: "/ocm/flows", label: "Chatbot Flows", icon: Bot, mod: "ocm.flows" },
       { to: "/ocm/social", label: "Social Scheduler", icon: Send, mod: "ocm.social" },
       { to: "/ocm/calendar", label: "Content Calendar", icon: CalendarDays, mod: "ocm.calendar" },
