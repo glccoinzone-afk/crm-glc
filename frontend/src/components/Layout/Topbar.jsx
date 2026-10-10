@@ -47,7 +47,7 @@ export default function Topbar() {
   return (
     <header
       data-testid="app-topbar"
-      className="glass sticky top-0 z-20 h-16 border-b border-slate-200/70 flex items-center px-4 lg:px-8 lg:pl-[300px]"
+      className="glass sticky top-0 z-20 h-16 border-b border-slate-200/70 flex items-center px-4 lg:px-8"
     >
       <button
         data-testid="mobile-menu-btn"

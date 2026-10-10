@@ -3,9 +3,9 @@ import { motion } from "framer-motion";
 
 export function PageHeader({ title, subtitle, actions, testId = "page-header" }) {
   return (
-    <div data-testid={testId} className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-6">
+    <div data-testid={testId} className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-6 pb-5 border-b border-slate-200/70">
       <motion.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }}>
-        <h1 className="text-2xl md:text-[28px] font-semibold tracking-tight text-slate-900">{title}</h1>
+        <h1 className="text-[22px] md:text-[26px] font-semibold tracking-tight text-slate-900">{title}</h1>
         {subtitle && <p className="text-[13px] text-slate-500 mt-1">{subtitle}</p>}
       </motion.div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
@@ -27,7 +27,7 @@ export function StatCard({ label, value, change, icon: Icon, tone = "primary", t
       data-testid={testId}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      className="bg-white rounded-2xl border border-slate-200/70 p-5 card-elev"
+      className="relative overflow-hidden bg-white rounded-2xl border border-slate-200/70 p-5 card-elev hover:-translate-y-0.5 transition-transform"
     >
       <div className="flex items-center justify-between">
         <div className="text-[11px] uppercase tracking-[0.08em] font-semibold text-slate-500">{label}</div>
@@ -131,7 +131,7 @@ export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", 
       <div className="overflow-x-auto">
         <table className="w-full text-[13px]">
           <thead>
-            <tr className="bg-slate-50/80 backdrop-blur-sm border-b border-slate-200">
+            <tr className="bg-slate-50 border-b border-slate-200 sticky top-0 z-[1]">
               {columns.map((c) => (
                 <th key={c.key} className={`px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500 text-left ${c.align === "right" ? "text-right" : ""}`}>
                   {c.header}
@@ -148,7 +148,7 @@ export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", 
               <tr
                 key={r.id || idx}
                 onClick={() => onRowClick && onRowClick(r)}
-                className={`border-b border-slate-100 hover:bg-slate-50/70 ${onRowClick ? "cursor-pointer" : ""}`}
+                className={`border-b border-slate-100 last:border-0 hover:bg-emerald-50/40 transition-colors ${onRowClick ? "cursor-pointer" : ""}`}
               >
                 {columns.map((c) => (
                   <td key={c.key} className={`px-4 py-3 text-slate-800 ${c.align === "right" ? "text-right" : ""} ${c.mono ? "font-mono tabular text-[12.5px]" : ""}`}>

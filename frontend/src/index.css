@@ -8,7 +8,7 @@
 @layer base {
   :root {
     /* GLC Zone light-mode enterprise palette */
-    --background: 60 20% 98%;              /* soft warm off-white app bg */
+    --background: 210 25% 97%;             /* cool soft app bg */
     --surface: 0 0% 100%;                  /* card/surface */
     --foreground: 222 47% 11%;
     --card: 0 0% 100%;
@@ -33,7 +33,7 @@
     --chart-3: 27 90% 55%;
     --chart-4: 38 92% 50%;
     --chart-5: 210 90% 55%;
-    --radius: 0.875rem;
+    --radius: 0.75rem;
   }
 }
 
@@ -110,9 +110,9 @@ body {
 
 .card-elev {
   box-shadow:
-    0 0 0 1px rgba(15, 23, 42, 0.03),
-    0 4px 10px -3px rgba(15, 23, 42, 0.05),
-    0 12px 24px -8px rgba(15, 23, 42, 0.04);
+    0 0 0 1px rgba(15, 23, 42, 0.04),
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 8px 20px -10px rgba(15, 23, 42, 0.08);
 }
 
 .side-item {
@@ -144,3 +144,31 @@ body {
 
 /* Prevent tap highlight */
 button, a { -webkit-tap-highlight-color: transparent; }
+
+
+/* ---- App shell: dark sidebar ---- */
+.glc-side {
+  background: linear-gradient(180deg, hsl(160 45% 9%) 0%, hsl(160 40% 6%) 100%);
+  border-right: 1px solid rgba(255, 255, 255, 0.04);
+}
+.glc-side-item {
+  color: rgba(255, 255, 255, 0.66);
+  transition: background-color 120ms ease, color 120ms ease;
+  position: relative;
+}
+.glc-side-item:hover { background: rgba(255, 255, 255, 0.06); color: #fff; }
+.glc-side-item[data-active="true"] {
+  background: rgba(52, 211, 153, 0.14);
+  color: #fff;
+  font-weight: 500;
+}
+.glc-side-item[data-active="true"]::before {
+  content: "";
+  position: absolute; left: -12px; top: 8px; bottom: 8px; width: 3px;
+  border-radius: 0 3px 3px 0; background: #34d399;
+}
+.glc-side-item[data-active="true"] svg { color: #6ee7b7; }
+.glc-side-scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); background-clip: padding-box; }
+
+.glc-page { padding: 24px 32px 48px; max-width: 1600px; margin: 0 auto; }
+@media (max-width: 1023px) { .glc-page { padding: 16px; } }

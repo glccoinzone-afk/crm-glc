@@ -6,7 +6,7 @@ export default function AppLayout({ children }) {
   return (
     <div className="min-h-screen bg-[hsl(var(--background))]">
       <Sidebar />
-      <div className="lg:pl-[288px]">
+      <div className="lg:pl-[264px]">
         <Topbar />
         <main className="glc-page">{children}</main>
       </div>
