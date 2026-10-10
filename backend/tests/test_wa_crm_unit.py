@@ -97,3 +97,10 @@ def test_signature_and_codes():
     assert w.verify_meta_signature(raw, good, "s") and not w.verify_meta_signature(raw, "sha256=bad", "s")
     assert w.verify_meta_signature(raw, "", "")
     assert len(w.new_short_code()) == 7
+
+
+def test_relay_signature_matches_store_format():
+    import hashlib, hmac
+    sts = [{"waMessageId": "wamid.1", "status": "delivered"}, {"waMessageId": "wamid.2", "status": "read"}]
+    expected = hmac.new(b"k", b"wamid.1|DELIVERED\nwamid.2|READ", hashlib.sha256).hexdigest()
+    assert w.relay_signature("k", sts) == expected

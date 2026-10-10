@@ -247,6 +247,12 @@ def new_short_code() -> str:
     return secrets.token_urlsafe(5).replace("-", "a").replace("_", "b")[:7]
 
 
+def relay_signature(secret: str, statuses: List[Dict[str, Any]]) -> str:
+    """HMAC over 'id|status' lines; the Laravel store builds the same string so no JSON canonicalisation is needed."""
+    text = "\n".join(f"{x.get('waMessageId')}|{str(x.get('status', '')).upper()}" for x in statuses)
+    return hmac.new(secret.encode(), text.encode(), hashlib.sha256).hexdigest()
+
+
 def verify_meta_signature(raw: bytes, header: str, secret: str) -> bool:
     if not secret:
         return True
@@ -351,7 +357,7 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
     @api.get("/ocm/wa/settings")
     async def wa_get_settings(user=Depends(current_user)):
         c = await cfg()
-        info: Dict[str, Any] = {"tokenSet": bool(c["token"]), "phoneId": c["phoneId"], "wabaId": c["wabaId"], "verifyTokenSet": bool(os.environ.get("WHATSAPP_VERIFY_TOKEN"))}
+        info: Dict[str, Any] = {"tokenSet": bool(c["token"]), "phoneId": c["phoneId"], "wabaId": c["wabaId"], "lastReceiptAt": (await db.ocm_settings.find_one({"key": "whatsapp"}, {"_id": 0}) or {}).get("lastReceiptAt")}
         if c["token"] and c["phoneId"]:
             r = await graph("GET", f"{c['phoneId']}?fields=display_phone_number,verified_name,quality_rating,name_status", c["token"])
             info["phone"] = r.json() if r.ok else {"error": meta_error(r)}
@@ -650,6 +656,36 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
             return PlainTextResponse(q.get("hub.challenge", ""))
         raise HTTPException(403, "Verification failed")
 
+    async def apply_statuses(statuses: List[Dict[str, Any]]) -> int:
+        """Record delivery receipts on campaign messages (or inbox replies). Returns how many were applied."""
+        applied = 0
+        for st in statuses:
+            if not st.get("waMessageId"):
+                continue
+            doc = await db.ocm_wa_messages.find_one({"waMessageId": st["waMessageId"]})
+            if doc:
+                new = advance_status(doc.get("status", "SENT"), st["status"])
+                upd: Dict[str, Any] = {"status": new, f"at{st['status'].title()}": now_iso()}
+                if st["status"] == "FAILED":
+                    upd["error"] = st.get("error") or "Failed"
+                await db.ocm_wa_messages.update_one({"id": doc["id"]}, {"$set": upd})
+                applied += 1
+            else:  # reply sent from the inbox
+                await db.ocm_messages.update_one({"waMessageId": st["waMessageId"]}, {"$set": {"status": st["status"]}})
+        if statuses:
+            await db.ocm_settings.update_one({"key": "whatsapp"}, {"$set": {"key": "whatsapp", "lastReceiptAt": now_iso()}}, upsert=True)
+        return applied
+
+    @api.post("/ocm/wa/status-relay")
+    async def wa_status_relay(request: Request):
+        """The store's Meta webhook forwards delivery receipts here, signed with the shared CRM secret."""
+        secret = os.environ.get("CRM_SSO_SECRET", "")
+        body = await request.json()
+        statuses = [{"waMessageId": x.get("id"), "status": str(x.get("status", "")).upper(), "error": x.get("error", "")} for x in body.get("statuses", [])]
+        if not secret or not hmac.compare_digest(relay_signature(secret, statuses), str(body.get("sig", ""))):
+            raise HTTPException(401, "Invalid signature")
+        return {"ok": True, "applied": await apply_statuses(statuses)}
+
     @api.post("/webhooks/whatsapp")
     async def wa_webhook(request: Request):
         raw = await request.body()
@@ -659,16 +695,7 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
             body = json.loads(raw or b"{}")
         except ValueError:
             raise HTTPException(400, "Bad JSON")
-        for st in parse_status_webhook(body):
-            doc = await db.ocm_wa_messages.find_one({"waMessageId": st["waMessageId"]})
-            if doc:
-                new = advance_status(doc.get("status", "SENT"), st["status"])
-                upd: Dict[str, Any] = {"status": new, f"at{st['status'].title()}": now_iso()}
-                if st["status"] == "FAILED":
-                    upd["error"] = st["error"] or "Failed"
-                await db.ocm_wa_messages.update_one({"id": doc["id"]}, {"$set": upd})
-            else:  # reply sent from the inbox
-                await db.ocm_messages.update_one({"waMessageId": st["waMessageId"]}, {"$set": {"status": st["status"]}})
+        await apply_statuses(parse_status_webhook(body))
         for m in parse_inbound_webhook(body):
             if is_stop_request(m["text"]):
                 await db.ocm_contacts.update_many(

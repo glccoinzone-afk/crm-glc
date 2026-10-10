@@ -37,7 +37,7 @@ function SetupCard({ settings, reload }) {
     { ok: settings?.tokenSet, label: "Access token on the server", help: "Set WHATSAPP_ACCESS_TOKEN in the backend .env" },
     { ok: !!settings?.phoneId && phone && !phone.error, label: phone?.display_phone_number ? `Number ${phone.display_phone_number} (${phone.verified_name || "unnamed"})` : "Phone number connected", help: phone?.error || "Set WHATSAPP_PHONE_NUMBER_ID in the backend .env" },
     { ok: !!settings?.wabaId && waCheck && !waCheck.error, label: waCheck?.name ? `Business account ${waCheck.name}` : "WhatsApp Business Account ID", help: waCheck?.error || "Paste the Account ID from WhatsApp Manager below" },
-    { ok: settings?.verifyTokenSet, label: "Webhook verify token", help: "Set WHATSAPP_VERIFY_TOKEN, then use /api/webhooks/whatsapp as the callback URL in Meta" },
+    { ok: !!settings?.lastReceiptAt, label: settings?.lastReceiptAt ? `Delivery receipts arriving (last ${fmtDateTime(settings.lastReceiptAt)})` : "Delivery receipts", help: "Appears after the first campaign message is delivered. Delivered and read counts need it." },
   ];
   return (
     <Card>
