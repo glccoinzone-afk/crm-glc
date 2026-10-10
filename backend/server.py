@@ -21,6 +21,7 @@ from fastapi import UploadFile, File, Response, Header
 from pymongo import ReturnDocument
 import glc_finance as gf
 import wa_crm
+import channels_hub
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -4643,6 +4644,7 @@ async def root():
 
 
 wa_crm.register(app, api, db, current_user, uid, now_iso, clean, log_activity)
+channels_hub.register(api, db, current_user, send_platform_message, log_activity)
 app.include_router(api)
 
 app.add_middleware(

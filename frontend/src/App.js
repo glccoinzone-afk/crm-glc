@@ -30,6 +30,8 @@ import { Projects, Tasks, Tickets, Documents, AuditLog } from "@/pages/misc/Misc
 import Settings from "@/pages/Settings";
 import Inbox from "@/pages/ocm/Inbox";
 import { Broadcasts, Flows, SocialScheduler, ContentCalendar } from "@/pages/ocm/Ocm";
+import Channels from "@/pages/ocm/Channels";
+import Reports from "@/pages/ocm/Reports";
 import Guide from "@/pages/Guide";
 import WaOverview from "@/pages/ocm/wa/WaOverview";
 import WaTemplates from "@/pages/ocm/wa/WaTemplates";
@@ -98,6 +100,8 @@ function AppRoutes() {
       <Route path="/tickets" element={<Guard module="tickets"><Tickets /></Guard>} />
       <Route path="/documents" element={<Guard module="documents"><Documents /></Guard>} />
       <Route path="/guide" element={<Guard module="dashboard"><Guide /></Guard>} />
+      <Route path="/ocm/channels" element={<Guard module="ocm.channels"><Channels /></Guard>} />
+      <Route path="/ocm/reports" element={<Guard module="ocm.reports"><Reports /></Guard>} />
       <Route path="/ocm/whatsapp" element={<Guard module="ocm.whatsapp"><WaOverview /></Guard>} />
       <Route path="/ocm/templates" element={<Guard module="ocm.templates"><WaTemplates /></Guard>} />
       <Route path="/ocm/campaigns" element={<Guard module="ocm.campaigns"><WaCampaigns /></Guard>} />

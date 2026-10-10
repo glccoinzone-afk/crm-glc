@@ -40,6 +40,7 @@ const GUIDE = [
   {
     group: "Omnichannel (WhatsApp and more)",
     items: [
+      { to: "/ocm/channels", name: "Channels", what: "One place to see every channel (WhatsApp, Telegram, Facebook, Instagram, website chat): is it connected, are the credentials still valid, and how much traffic it has.", how: "Open it first when something stops working. Each card is checked live. Use Send test to confirm a channel can really send, and How to connect for the steps if it is not set up." },
       { to: "/ocm/whatsapp", name: "WhatsApp", what: "Overview of your WhatsApp setup and results: reachable contacts, delivered and read rates, and a connection checklist.", how: "Start here. If a checklist step is amber, fix it first. Enter your WhatsApp Business Account ID here." },
       { to: "/ocm/inbox", name: "Inbox", what: "Every customer conversation (WhatsApp, Telegram, website chat) in one place, with unread counts.", how: "Filter Mine / Open / Unread. Assign a chat, add private notes, reply, and type / to use saved replies. WhatsApp only delivers free text within 24 hours of the customer's last message." },
       { to: "/ocm/contacts", name: "Contacts", what: "Your audience list with tags, opt-in status and saved segments.", how: "Import a CSV (name, phone, email, tags), tag people, then save a filter as a segment to reuse in campaigns. Customers who reply STOP are opted out automatically." },
@@ -48,6 +49,7 @@ const GUIDE = [
       { to: "/ocm/broadcasts", name: "Quick Broadcast", what: "The older simple broadcast: a plain text message to many contacts across channels.", how: "Works only inside the 24-hour window on WhatsApp. For marketing use Campaigns instead." },
       { to: "/ocm/flows", name: "Chatbot Flows", what: "Automatic replies. A keyword (or a first message) triggers a set of messages.", how: "Create a flow, set the keyword, write the messages in order, activate it. If no flow matches, the AI assistant answers." },
       { to: "/ocm/links", name: "Short Links", what: "Short tracked links you can put in messages.", how: "Paste a long URL, copy the short one, and watch the click count." },
+      { to: "/ocm/reports", name: "Reports", what: "Messages per day, per channel, new contacts, open chats and how fast you reply.", how: "Switch between 7, 30 and 90 days. The reply time is the median across recent conversations." },
       { to: "/ocm/social", name: "Social Scheduler", what: "Plan and publish posts to your social pages.", how: "Write a post, pick channels and a time, then publish or let it go out on schedule." },
       { to: "/ocm/calendar", name: "Content Calendar", what: "Calendar view of everything scheduled.", how: "Use it to spot gaps and clashes in your posting plan." },
       { to: "/sellers", name: "Seller Management", what: "Marketplace sellers connected from the website.", how: "Review sellers, sync them from the store and check their status." },
