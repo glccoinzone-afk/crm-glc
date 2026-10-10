@@ -20,6 +20,7 @@ from pathlib import Path
 from fastapi import UploadFile, File, Response, Header
 from pymongo import ReturnDocument
 import glc_finance as gf
+import wa_crm
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -3217,7 +3218,11 @@ async def ocm_message_incoming(request: Request):
         "createdAt": now_iso(),
     }
     await db.ocm_messages.insert_one(in_msg)
-    await db.ocm_conversations.update_one({"id": conversation["id"]}, {"$set": {"lastMessage": text, "lastMessageAt": now_iso(), "status": "OPEN"}})
+    await db.ocm_conversations.update_one({"id": conversation["id"]}, {"$set": {"lastMessage": text, "lastMessageAt": now_iso(), "status": "OPEN"}, "$inc": {"unread": 1}})
+
+    if wa_crm.is_stop_request(text):  # "STOP" opts the contact out of campaigns
+        await db.ocm_contacts.update_one({"id": contact["id"]}, {"$set": {"optedOut": True, "subscribed": False, "optedOutAt": now_iso()}})
+        return {"ok": True}
 
     flow_matched = await run_matching_flows(contact, conversation, text, channel)
     if flow_matched:
@@ -4637,6 +4642,7 @@ async def root():
     return {"message": "GLC Zone CRM+ERP API", "version": "1.0.0"}
 
 
+wa_crm.register(app, api, db, current_user, uid, now_iso, clean, log_activity)
 app.include_router(api)
 
 app.add_middleware(
