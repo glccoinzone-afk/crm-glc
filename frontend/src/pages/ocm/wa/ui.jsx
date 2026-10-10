@@ -1,5 +1,7 @@
 import React from "react";
-import { Loader2, X } from "lucide-react";
+import { Loader2, X, Paperclip, FileText, Film, Image as ImageIcon } from "lucide-react";
+import { toast } from "sonner";
+import api from "@/lib/glc";
 
 export const WA_GREEN = "#25D366";
 
@@ -166,7 +168,7 @@ export function TagInput({ value, onChange, placeholder = "Type a tag and press 
 }
 
 /** WhatsApp-style bubble preview used by the template and campaign screens. */
-export function PhonePreview({ header, body, footer, buttons = [], title = "GLC Zone" }) {
+export function PhonePreview({ header, body, footer, buttons = [], title = "GLC Zone", media }) {
   return (
     <div className="mx-auto w-[260px] rounded-[28px] border-[6px] border-slate-800 bg-slate-800 shadow-xl overflow-hidden">
       <div className="bg-[#075E54] text-white px-3 py-2 text-[12px] font-medium flex items-center gap-2">
@@ -174,7 +176,8 @@ export function PhonePreview({ header, body, footer, buttons = [], title = "GLC 
       </div>
       <div className="min-h-[220px] p-3" style={{ background: "#ECE5DD" }}>
         <div className="max-w-[92%] rounded-xl rounded-tl-sm bg-white px-3 py-2 shadow-sm">
-          {header && <div className="text-[13px] font-semibold text-slate-900 mb-1">{header}</div>}
+          {media && <MediaBox media={media} />}
+          {header && !media && <div className="text-[13px] font-semibold text-slate-900 mb-1">{header}</div>}
           <div className="text-[12.5px] text-slate-800 whitespace-pre-wrap break-words">{body || <span className="text-slate-400">Your message appears here</span>}</div>
           {footer && <div className="text-[10.5px] text-slate-400 mt-1.5">{footer}</div>}
           <div className="text-[9.5px] text-slate-400 text-right mt-1">10:30 ✓✓</div>
@@ -196,3 +199,58 @@ export function Progress({ value, tone = "bg-[#25D366]" }) {
 }
 
 export const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+
+const FMT_ICON = { IMAGE: ImageIcon, VIDEO: Film, DOCUMENT: FileText };
+export const MEDIA_ACCEPT = { IMAGE: ".jpg,.jpeg,.png", VIDEO: ".mp4,.3gp", DOCUMENT: ".pdf", ANY: ".jpg,.jpeg,.png,.mp4,.3gp,.pdf" };
+
+/** Image/video/document block shown inside a WhatsApp bubble. media: {format, url?, name?} */
+export function MediaBox({ media }) {
+  const Icon = FMT_ICON[media.format] || FileText;
+  if (media.format === "IMAGE" && media.url) return <img src={media.url} alt="" className="rounded-lg mb-1.5 w-full max-h-40 object-cover" />;
+  if (media.format === "VIDEO" && media.url) return <video src={media.url} className="rounded-lg mb-1.5 w-full max-h-40 bg-black" muted />;
+  return (
+    <div className="rounded-lg mb-1.5 bg-slate-100 h-20 grid place-items-center text-slate-500 text-[11px]">
+      <div className="flex flex-col items-center gap-1"><Icon size={20} />{media.name || media.format.toLowerCase()}</div>
+    </div>
+  );
+}
+
+/** Uploads one file to the CRM and reports the stored media record. `format` limits what can be chosen (IMAGE | VIDEO | DOCUMENT | ANY). */
+export function MediaPicker({ format = "ANY", value, onChange, label = "Attach file" }) {
+  const [busy, setBusy] = React.useState(false);
+  const ref = React.useRef(null);
+  const pick = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const { data } = await api.post("/ocm/wa/media", fd, { headers: { "Content-Type": "multipart/form-data" } });
+      if (format !== "ANY" && data.format !== format) throw new Error(`Please choose a ${format.toLowerCase()} file`);
+      onChange({ ...data, url: URL.createObjectURL(file) });
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || err.message || "Upload failed");
+    } finally { setBusy(false); }
+  };
+  return (
+    <div>
+      <input ref={ref} type="file" accept={MEDIA_ACCEPT[format]} onChange={pick} className="hidden" />
+      {value ? (
+        <div className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+          <div className="w-10 h-10 rounded-md overflow-hidden bg-slate-200 grid place-items-center shrink-0">
+            {value.format === "IMAGE" && value.url ? <img src={value.url} alt="" className="w-full h-full object-cover" /> : React.createElement(FMT_ICON[value.format] || FileText, { size: 18, className: "text-slate-500" })}
+          </div>
+          <div className="min-w-0 flex-1"><div className="text-[12.5px] font-medium text-slate-800 truncate">{value.filename || value.name}</div><div className="text-[11px] text-slate-400">{value.format.toLowerCase()}{value.size ? ` · ${(value.size / 1024 / 1024).toFixed(1)} MB` : ""}</div></div>
+          <button onClick={() => onChange(null)} className="text-slate-400 hover:text-rose-600"><X size={15} /></button>
+        </div>
+      ) : (
+        <button type="button" onClick={() => ref.current?.click()} disabled={busy} className="w-full h-10 rounded-lg border border-dashed border-slate-300 text-[13px] text-slate-600 hover:border-slate-400 hover:bg-slate-50 inline-flex items-center justify-center gap-2 disabled:opacity-60">
+          {busy ? <Loader2 size={14} className="animate-spin" /> : <Paperclip size={14} />} {label}
+        </button>
+      )}
+      <div className="text-[11px] text-slate-400 mt-1">{format === "ANY" ? "JPG/PNG up to 5 MB, MP4 or PDF up to 16 MB" : format === "IMAGE" ? "JPG or PNG, up to 5 MB" : format === "VIDEO" ? "MP4, up to 16 MB" : "PDF, up to 16 MB"}</div>
+    </div>
+  );
+}

@@ -4,9 +4,9 @@ import { toast } from "sonner";
 import api from "@/lib/glc";
 import { PageHeader, EmptyState } from "@/components/common/GlcUI";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Card, Btn, Pill, Input, Textarea, Select, Tabs, PhonePreview, errMsg, templateTone } from "./ui";
+import { Card, Btn, Pill, Input, Textarea, Select, Tabs, PhonePreview, MediaPicker, errMsg, templateTone } from "./ui";
 
-const blank = { name: "", category: "UTILITY", language: "en", header: "", body: "", footer: "", examples: [], buttons: [] };
+const blank = { name: "", category: "UTILITY", language: "en", headerFormat: "TEXT", header: "", body: "", footer: "", examples: [], buttons: [] };
 const paramCount = (t) => Math.max(0, ...[...(t || "").matchAll(/\{\{\s*(\d+)\s*\}\}/g)].map((m) => Number(m[1])));
 
 const catHelp = {
@@ -17,8 +17,9 @@ const catHelp = {
 
 function TemplateDialog({ open, onClose, onCreated }) {
   const [f, setF] = useState(blank);
+  const [media, setMedia] = useState(null);
   const [saving, setSaving] = useState(false);
-  useEffect(() => { if (open) setF(blank); }, [open]);
+  useEffect(() => { if (open) { setF(blank); setMedia(null); } }, [open]);
   const n = paramCount(f.body);
   const examples = useMemo(() => Array.from({ length: n }, (_, i) => f.examples[i] || ""), [n, f.examples]);
   const preview = useMemo(() => (f.body || "").replace(/\{\{\s*(\d+)\s*\}\}/g, (_, i) => examples[Number(i) - 1] || `{{${i}}}`), [f.body, examples]);
@@ -27,7 +28,7 @@ function TemplateDialog({ open, onClose, onCreated }) {
   const save = async () => {
     setSaving(true);
     try {
-      await api.post("/ocm/wa/templates", { ...f, examples });
+      await api.post("/ocm/wa/templates", { ...f, examples, headerMediaId: media?.id || null });
       toast.success("Sent to Meta for review");
       onCreated();
       onClose();
@@ -51,7 +52,11 @@ function TemplateDialog({ open, onClose, onCreated }) {
               </Select>
             </div>
             <div className="flex items-start gap-2 text-[11.5px] text-slate-500 bg-slate-50 rounded-lg px-3 py-2"><Info size={13} className="mt-0.5 shrink-0" />{catHelp[f.category]}</div>
-            <Input label="Header (optional)" value={f.header} onChange={set("header")} maxLength={60} />
+            <Select label="Header" value={f.headerFormat} onChange={(e) => { setF({ ...f, headerFormat: e.target.value }); setMedia(null); }}>
+              <option value="TEXT">Text (or none)</option><option value="IMAGE">Image</option><option value="VIDEO">Video</option><option value="DOCUMENT">PDF document</option>
+            </Select>
+            {f.headerFormat === "TEXT" ? <Input label="Header text (optional)" value={f.header} onChange={set("header")} maxLength={60} />
+              : <div><div className="text-[12px] font-medium text-slate-600 mb-1">Sample {f.headerFormat.toLowerCase()} (Meta reviews it; you choose the real one for each campaign)</div><MediaPicker format={f.headerFormat} value={media} onChange={setMedia} label={`Choose a sample ${f.headerFormat.toLowerCase()}`} /></div>}
             <Textarea label="Message body" rows={5} value={f.body} onChange={set("body")} maxLength={1024} placeholder={"Hi {{1}}, your order {{2}} is on the way."} hint={`Use {{1}}, {{2}} for variables. ${f.body.length}/1024`} />
             {n > 0 && (
               <div className="space-y-2">
@@ -84,12 +89,12 @@ function TemplateDialog({ open, onClose, onCreated }) {
           </div>
           <div className="md:sticky md:top-0 self-start">
             <div className="text-[12px] font-medium text-slate-600 mb-2 text-center">Preview</div>
-            <PhonePreview header={f.header} body={preview} footer={f.footer} buttons={f.buttons} />
+            <PhonePreview header={f.headerFormat === "TEXT" ? f.header : ""} media={f.headerFormat !== "TEXT" ? { format: f.headerFormat, url: media?.url, name: media?.filename } : null} body={preview} footer={f.footer} buttons={f.buttons} />
           </div>
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn variant="green" onClick={save} loading={saving} disabled={!f.name || !f.body}>Submit for approval</Btn>
+          <Btn variant="green" onClick={save} loading={saving} disabled={!f.name || !f.body || (f.headerFormat !== "TEXT" && !media)}>Submit for approval</Btn>
         </div>
       </DialogContent>
     </Dialog>
@@ -154,7 +159,7 @@ export default function WaTemplates() {
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <div className="font-mono text-[13px] font-medium text-slate-900 truncate">{t.name}</div>
-                  <div className="text-[11.5px] text-slate-500 mt-0.5">{t.category} · {t.language}</div>
+                  <div className="text-[11.5px] text-slate-500 mt-0.5">{t.category} · {t.language}{["IMAGE", "VIDEO", "DOCUMENT"].includes(t.headerFormat) ? ` · ${t.headerFormat.toLowerCase()} header` : ""}</div>
                 </div>
                 <Pill tone={templateTone(t.status)}>{(t.status || "").replace("_", " ")}</Pill>
               </div>

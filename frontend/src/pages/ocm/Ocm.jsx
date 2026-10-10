@@ -5,6 +5,7 @@ import api, { fmtDate } from "@/lib/glc";
 import { PageHeader, DataGrid, StatusBadge, EmptyState, StatCard } from "@/components/common/GlcUI";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Field, SelectField } from "@/pages/crm/Leads";
+import { MediaPicker } from "@/pages/ocm/wa/ui";
 import { toast } from "sonner";
 
 const CH_COLORS = { TELEGRAM: "#0088CC", WHATSAPP: "#25D366", INSTAGRAM: "#E1306C", FACEBOOK: "#1877F2", WEBCHAT: "#064E3B", YOUTUBE: "#FF0000" };
@@ -163,14 +164,14 @@ export function Flows() {
       trigger: f.trigger || "KEYWORD",
       triggerValue: f.triggerValue || "",
       status: f.status || "DRAFT",
-      steps: (f.steps && f.steps.length > 0) ? f.steps.map((s) => ({ type: s.type || "MESSAGE", text: s.text || "" })) : [{ type: "MESSAGE", text: "" }],
+      steps: (f.steps && f.steps.length > 0) ? f.steps.map((s) => ({ type: s.type || "MESSAGE", text: s.text || "", mediaId: s.mediaId, mediaFormat: s.mediaFormat, mediaName: s.mediaName })) : [{ type: "MESSAGE", text: "" }],
     });
     setOpen(true);
   };
 
   const save = async () => {
     if (!form.name) return;
-    const cleanSteps = form.steps.filter((s) => (s.text || "").trim() !== "");
+    const cleanSteps = form.steps.filter((s) => (s.text || "").trim() !== "" || s.mediaId);
     const payload = { ...form, steps: cleanSteps.length > 0 ? cleanSteps : [{ type: "MESSAGE", text: "" }] };
     if (editingId) {
       await api.put(`/ocm/flows/${editingId}`, payload);
@@ -188,6 +189,7 @@ export function Flows() {
   const addStep = () => setForm({ ...form, steps: [...form.steps, { type: "MESSAGE", text: "" }] });
   const removeStep = (i) => setForm({ ...form, steps: form.steps.filter((_, idx) => idx !== i) });
   const updateStep = (i, text) => setForm({ ...form, steps: form.steps.map((s, idx) => (idx === i ? { ...s, text } : s)) });
+  const setStepMedia = (i, m) => setForm({ ...form, steps: form.steps.map((s, idx) => (idx === i ? { ...s, mediaId: m?.id, mediaFormat: m?.format, mediaName: m?.filename } : s)) });
   const moveStep = (i, dir) => {
     const j = i + dir;
     if (j < 0 || j >= form.steps.length) return;
@@ -217,7 +219,7 @@ export function Flows() {
                 {(f.steps || []).slice(0, 4).map((s, i) => (
                   <div key={i} className="text-[12px] px-2.5 py-1.5 bg-slate-50 border border-slate-100 rounded-lg">
                     <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 mr-1.5">{s.type}</span>
-                    <span className="text-slate-700">{s.text || (s.options ? `${s.options.length} branch(es)` : "—")}</span>
+                    <span className="text-slate-700">{s.mediaId ? `[${(s.mediaFormat || "file").toLowerCase()}] ` : ""}{s.text || (s.options ? `${s.options.length} branch(es)` : s.mediaId ? "" : "—")}</span>
                   </div>
                 ))}
                 {(f.steps || []).length > 4 && <div className="text-[11px] text-slate-400">+{f.steps.length - 4} more steps</div>}
@@ -262,9 +264,14 @@ export function Flows() {
                       value={s.text}
                       onChange={(e) => updateStep(i, e.target.value)}
                       rows={2}
-                      placeholder={`Step ${i + 1} message…`}
+                      placeholder={`Step ${i + 1} message${form.channel === "WHATSAPP" ? " (caption if you attach a file)" : ""}…`}
                       className="flex-1 px-3 py-2 rounded-lg border border-slate-200 text-[13px]"
                     />
+                    {form.channel === "WHATSAPP" && (
+                      <div className="w-48 shrink-0">
+                        <MediaPicker format="ANY" label="Image / video / PDF" value={s.mediaId ? { id: s.mediaId, format: s.mediaFormat || "IMAGE", filename: s.mediaName || "attached file" } : null} onChange={(m) => setStepMedia(i, m)} />
+                      </div>
+                    )}
                     <div className="flex flex-col gap-1 mt-0.5">
                       <button type="button" onClick={() => moveStep(i, -1)} disabled={i === 0} className="text-[10px] text-slate-400 hover:text-slate-600 disabled:opacity-30">▲</button>
                       <button type="button" onClick={() => moveStep(i, 1)} disabled={i === form.steps.length - 1} className="text-[10px] text-slate-400 hover:text-slate-600 disabled:opacity-30">▼</button>

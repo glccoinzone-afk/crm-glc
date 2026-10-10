@@ -3096,6 +3096,24 @@ async def run_ai_reply(contact: dict, conversation: dict, incoming_text: str, la
         {"$set": {"lastMessage": ai_text, "lastMessageAt": now_iso()}}
     )
 
+async def send_flow_media(contact: dict, media_id: str, caption: str) -> str:
+    """Send a flow step's image/video/document on WhatsApp. Returns the text to log in the conversation."""
+    media = await db.ocm_media.find_one({"id": media_id}, {"_id": 0})
+    to = contact.get("whatsappId") or contact.get("phone")
+    if not media or not to or not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        log.warning("Flow media skipped: missing file, recipient or WhatsApp credentials")
+        return caption or "[media not sent]"
+    label = f"[{media['format'].lower()}] {caption}".strip()
+    try:
+        mid = await asyncio.to_thread(wa_crm.cached_media_id, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, wa_crm.media_file_path(media), media["mime"])
+        res = await asyncio.to_thread(wa_crm.meta_send_media, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, to, media["format"], mid, caption, media["filename"])
+        if not res.get("success"):
+            log.warning(f"Flow media send failed: {res.get('error')}")
+    except Exception as e:
+        log.warning(f"Flow media send failed: {e}")
+    return label
+
+
 async def run_matching_flows(contact: dict, conversation: dict, incoming_text: str, channel: str):
     """Check active flows for a keyword match and auto-send their steps."""
     flows = await db.ocm_flows.find({"channel": channel, "status": {"$in": ["ACTIVE", "PUBLISHED"]}}).to_list(100)
@@ -3129,9 +3147,12 @@ async def run_matching_flows(contact: dict, conversation: dict, incoming_text: s
 
         for step in flow.get("steps", []):
             step_text = step.get("text") or step.get("message")
-            if not step_text:
+            if step.get("mediaId") and channel == "WHATSAPP":
+                step_text = await send_flow_media(contact, step.get("mediaId"), step_text or "")
+            elif not step_text:
                 continue
-            send_platform_message(channel, contact, step_text)
+            else:
+                send_platform_message(channel, contact, step_text)
             out_msg = {
                 "id": uid(),
                 "conversationId": conversation["id"],

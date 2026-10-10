@@ -104,3 +104,27 @@ def test_relay_signature_matches_store_format():
     sts = [{"waMessageId": "wamid.1", "status": "delivered"}, {"waMessageId": "wamid.2", "status": "read"}]
     expected = hmac.new(b"k", b"wamid.1|DELIVERED\nwamid.2|READ", hashlib.sha256).hexdigest()
     assert w.relay_signature("k", sts) == expected
+
+
+def test_media_kind_accepts_only_whatsapp_formats():
+    assert w.media_kind("Offer.JPG") == ("IMAGE", "image/jpeg")
+    assert w.media_kind("clip.mp4") == ("VIDEO", "video/mp4")
+    assert w.media_kind("rates.pdf") == ("DOCUMENT", "application/pdf")
+    assert w.media_kind("anim.gif") is None and w.media_kind("") is None
+
+
+def test_media_header_template_needs_a_sample_handle():
+    base = {"name": "glc_offer_img", "category": "marketing", "body": "Big sale", "headerFormat": "IMAGE"}
+    with pytest.raises(ValueError):
+        w.build_template_create_payload(base)
+    p = w.build_template_create_payload({**base, "headerHandle": "4::aW1hZ2U="})
+    assert p["components"][0] == {"type": "HEADER", "format": "IMAGE", "example": {"header_handle": ["4::aW1hZ2U="]}}
+
+
+def test_send_payload_with_media_header_and_body():
+    p = w.build_template_send_payload("919608261539", "glc_offer_img", "en", ["Rohit"], {"format": "IMAGE", "id": "m1"})
+    comps = p["template"]["components"]
+    assert comps[0] == {"type": "header", "parameters": [{"type": "image", "image": {"id": "m1"}}]}
+    assert comps[1]["type"] == "body"
+    doc = w.build_template_send_payload("1", "n", "en", [], {"format": "DOCUMENT", "id": "d1", "filename": "rates.pdf"})
+    assert doc["template"]["components"][0]["parameters"][0]["document"] == {"id": "d1", "filename": "rates.pdf"}

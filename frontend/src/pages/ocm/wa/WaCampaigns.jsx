@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import api from "@/lib/glc";
 import { PageHeader, EmptyState } from "@/components/common/GlcUI";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Card, Btn, Pill, Input, Select, Tabs, TagInput, PhonePreview, Progress, pct, errMsg, campaignTone, fmtDateTime } from "./ui";
+import { Card, Btn, Pill, Input, Select, Tabs, TagInput, PhonePreview, MediaPicker, Progress, pct, errMsg, campaignTone, fmtDateTime } from "./ui";
 
 const VARIABLES = ["{{name}}", "{{first_name}}", "{{phone}}"];
 
@@ -16,10 +16,12 @@ function Wizard({ open, onClose, onDone }) {
   const [f, setF] = useState(null);
   const [preview, setPreview] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [media, setMedia] = useState(null);
 
   useEffect(() => {
     if (!open) return;
     setStep(0);
+    setMedia(null);
     setF({ name: "", templateKey: "", params: [], audienceMode: "segment", segmentId: "", seg: { tags: [], anyTags: [], excludeTags: [], vertical: "ALL" }, when: "now", scheduledAt: "" });
     api.get("/ocm/wa/templates").then((r) => setTemplates((r.data.items || []).filter((t) => t.status === "APPROVED")));
     api.get("/ocm/segments").then((r) => setSegments(r.data.items || []));
@@ -40,8 +42,9 @@ function Wizard({ open, onClose, onDone }) {
   const params = Array.from({ length: n }, (_, i) => f.params[i] ?? "");
   const rendered = (tpl?.body || "").replace(/\{\{\s*(\d+)\s*\}\}/g, (_, i) => (params[Number(i) - 1] || `{{${i}}}`).replace("{{name}}", "Rohit Kumar").replace("{{first_name}}", "Rohit").replace("{{phone}}", "919608261539"));
 
+  const needsMedia = ["IMAGE", "VIDEO", "DOCUMENT"].includes(tpl?.headerFormat);
   const canNext = [
-    () => f.name.trim() && tpl && params.every((p) => p.trim()),
+    () => f.name.trim() && tpl && params.every((p) => p.trim()) && (!needsMedia || media),
     () => preview && preview.count > 0,
     () => f.when === "now" || f.scheduledAt,
   ][step]();
@@ -52,6 +55,7 @@ function Wizard({ open, onClose, onDone }) {
       const body = {
         name: f.name, templateName: tpl.name, language: tpl.language, params,
         ...audienceBody,
+        mediaFileId: needsMedia ? media?.id : null,
         scheduledAt: f.when === "later" ? new Date(f.scheduledAt).toISOString() : null,
       };
       const { data } = await api.post("/ocm/wa/campaigns", body);
@@ -89,6 +93,10 @@ function Wizard({ open, onClose, onDone }) {
                   {templates.map((t) => <option key={`${t.name}|${t.language}`} value={`${t.name}|${t.language}`}>{t.name} ({t.language})</option>)}
                 </Select>
                 {templates.length === 0 && <div className="text-[12px] text-amber-700 bg-amber-50 rounded-lg px-3 py-2">No approved templates yet. Create one on the Templates page and wait for Meta to approve it.</div>}
+                {needsMedia && (
+                  <div><div className="text-[12px] font-medium text-slate-600 mb-1">This template has a {tpl.headerFormat.toLowerCase()} header. Choose the file to send</div>
+                    <MediaPicker format={tpl.headerFormat} value={media} onChange={setMedia} label={`Choose ${tpl.headerFormat.toLowerCase()}`} /></div>
+                )}
                 {n > 0 && (
                   <div className="space-y-2">
                     <div className="text-[12px] font-medium text-slate-600">Fill the variables</div>
@@ -150,7 +158,7 @@ function Wizard({ open, onClose, onDone }) {
               </>
             )}
           </div>
-          <div className="md:sticky md:top-0 self-start"><PhonePreview body={rendered} footer={tpl?.components?.find((c) => c.type === "FOOTER")?.text} header={tpl?.components?.find((c) => c.type === "HEADER")?.text} /></div>
+          <div className="md:sticky md:top-0 self-start"><PhonePreview body={rendered} footer={tpl?.components?.find((c) => c.type === "FOOTER")?.text} header={needsMedia ? "" : tpl?.components?.find((c) => c.type === "HEADER")?.text} media={needsMedia ? { format: tpl.headerFormat, url: media?.url, name: media?.filename } : null} /></div>
         </div>
 
         <div className="flex justify-between pt-2">
