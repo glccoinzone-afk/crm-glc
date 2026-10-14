@@ -2031,6 +2031,84 @@ async def career_lead_webhook(request: Request):
     return {"ok": True, "id": data["id"], "created": True}
 
 
+@api.post("/webhooks/lead-inbox")
+async def career_lead_inbox_webhook(request: Request):
+    """glczone.in's Career applications page calls this when a reviewer presses "Move to inbox" on an application.
+    Finds or creates the applicant's WhatsApp contact and conversation, switches the AI off for that chat (a person talks to the
+    applicant), assigns it to the reviewer when the name matches a CRM user, and leaves an internal note with the application.
+    Same shared secret as the other webhooks. Safe to call again: it never makes a second contact or conversation."""
+    secret = request.headers.get("X-Crm-Bridge-Secret", "")
+    expected = os.getenv("CRM_BRIDGE_SECRET", "")
+    if not expected or not hmac.compare_digest(secret.encode(), expected.encode()):
+        raise HTTPException(401, "Unauthorized")
+
+    body = await request.json()
+    lead_id = str(body.get("lead_id", "")).strip()
+    name = str(body.get("name", "")).strip()
+    phone = wa_crm.normalize_phone(body.get("phone"))
+    kind = str(body.get("type", "")).strip().lower()
+    if not lead_id or not name or not phone:
+        raise HTTPException(400, "lead_id, name and a valid phone are required")
+    label = CAREER_LEAD_LABELS.get(kind, "Career")
+
+    # contact
+    tags = ["career", kind or "career"]
+    contact = await db.ocm_contacts.find_one({"$or": [{"phone": phone}, {"whatsappId": phone}]})
+    if not contact:
+        contact = {
+            "id": uid(), "name": name, "phone": phone, "whatsappId": phone, "email": str(body.get("email") or "").strip() or None,
+            "channels": ["WHATSAPP"], "tags": tags, "subscribed": True, "createdAt": now_iso(), "updatedAt": now_iso(),
+        }
+        await db.ocm_contacts.insert_one(dict(contact))
+    else:
+        upd = {"updatedAt": now_iso()}
+        if not contact.get("whatsappId"):
+            upd["whatsappId"] = phone
+        if not contact.get("name") or contact.get("name") in ["Unknown", "WhatsApp User"]:
+            upd["name"] = name
+        await db.ocm_contacts.update_one({"id": contact["id"]}, {"$set": upd, "$addToSet": {"tags": {"$each": tags}, "channels": "WHATSAPP"}})
+
+    # conversation: a person talks to the applicant, so the AI stays quiet in it
+    assignee_name = str(body.get("assignee") or "").strip()
+    agent = None
+    if assignee_name:
+        agent = await db.users.find_one({"name": {"$regex": "^" + re.escape(assignee_name) + "$", "$options": "i"}}, {"_id": 0, "id": 1, "name": 1})
+    conv = await db.ocm_conversations.find_one({"contactId": contact["id"], "channel": "WHATSAPP"})
+    created = False
+    if not conv:
+        created = True
+        conv = {
+            "id": uid(), "contactId": contact["id"], "channel": "WHATSAPP", "status": "OPEN",
+            "lastMessage": f"Career application: {label}", "lastMessageAt": now_iso(), "createdAt": now_iso(), "unread": 0,
+        }
+        await db.ocm_conversations.insert_one(dict(conv))
+    conv_upd = {"agentMode": True, "status": "OPEN", "updatedAt": now_iso()}
+    if agent:
+        conv_upd["assignedTo"] = agent["id"]
+        conv_upd["assignedName"] = agent["name"]
+    await db.ocm_conversations.update_one({"id": conv["id"]}, {"$set": conv_upd})
+
+    # internal note (only the team sees it)
+    lines = [f"Career application: {label} (glczone.in lead #{lead_id})"]
+    for key, title in (("city", "City"), ("qualification", "Qualification"), ("experience", "Experience"), ("message", "Message"), ("status", "Status")):
+        val = str(body.get(key) or "").strip()
+        if val:
+            lines.append(f"{title}: {val}")
+    details = body.get("details") or {}
+    if isinstance(details, dict):
+        for k, v in details.items():
+            if v not in (None, "", []):
+                lines.append(f"{str(k).replace('_', ' ').title()}: {v}")
+    if body.get("interview_at"):
+        lines.append(f"Interview: {body.get('interview_at')} ({body.get('interview_mode') or '-'}) {body.get('interview_place') or ''}".strip())
+    await db.ocm_notes.insert_one({"id": uid(), "conversationId": conv["id"], "text": "\n".join(lines), "by": "glczone.in", "byId": "system", "createdAt": now_iso()})
+
+    # remember the link on the CRM lead, if there is one
+    await db.leads.update_one({"glczone_lead_id": lead_id}, {"$set": {"conversationId": conv["id"], "contactId": contact["id"], "updatedAt": now_iso()}})
+    log.info(f"Career lead {lead_id} moved to the inbox (conversation {conv['id']}, created={created})")
+    return {"ok": True, "conversationId": conv["id"], "contactId": contact["id"], "created": created}
+
+
 # ===================== WITHDRAWALS (Two-way sync with glczone.in) =====================
 
 async def call_glczone_bridge(path: str, data: dict):
