@@ -1964,6 +1964,14 @@ CAREER_LEAD_LABELS = {"job": "Job", "franchise": "Franchise", "dpcp": "DPCP Part
 CAREER_STAGES = ("NEW", "CONTACTED", "QUALIFIED", "PROPOSAL", "NEGOTIATION", "WON", "LOST")
 
 
+async def has_interview_scheduled(contact: dict) -> bool:
+    """True when this WhatsApp number belongs to a website career applicant whose interview is scheduled (CRM stage NEGOTIATION)."""
+    digits = re.sub(r"\D", "", str(contact.get("whatsappId") or contact.get("phone") or ""))[-10:]
+    if len(digits) != 10:
+        return False
+    return bool(await db.leads.find_one({"glczone_lead_id": {"$exists": True}, "status": "NEGOTIATION", "phone": {"$regex": digits + "$"}}, {"_id": 1}))
+
+
 @api.post("/webhooks/lead-event")
 async def career_lead_webhook(request: Request):
     """glczone.in calls this when someone applies on the website's Career Opportunities (a job, a franchise or a DPCP).
@@ -3448,6 +3456,9 @@ async def ocm_message_incoming(request: Request):
     conv_fresh = await db.ocm_conversations.find_one({"id": conversation["id"]}, {"_id": 0})
     if (conv_fresh or {}).get("agentMode"):
         log.info(f"AgentMode ON for conv {conversation['id']} — AI skipped")
+    elif await has_interview_scheduled(contact):
+        # the applicant is replying to an interview invitation / reminder: the HR team answers, not Zara
+        log.info(f"Interview scheduled for contact {contact.get('id')} — AI skipped")
     else:
         await run_ai_reply(contact, conversation, text, preferred_lang or "Hindi", channel)
 
