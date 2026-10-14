@@ -1960,14 +1960,17 @@ async def order_event_webhook(request: Request):
 
 # ===================== CAREER LEADS (glczone.in Career Opportunities -> CRM leads) =====================
 
-CAREER_LEAD_LABELS = {"job": "Delivery Job", "franchise": "Franchise", "dpcp": "DPCP Partner"}
+CAREER_LEAD_LABELS = {"job": "Job", "franchise": "Franchise", "dpcp": "DPCP Partner"}
+CAREER_STAGES = ("NEW", "CONTACTED", "QUALIFIED", "PROPOSAL", "NEGOTIATION", "WON", "LOST")
 
 
 @api.post("/webhooks/lead-event")
 async def career_lead_webhook(request: Request):
     """glczone.in calls this when someone applies on the website's Career Opportunities (a job, a franchise or a DPCP).
     Same shared secret as the order webhook. Creates one CRM lead (status NEW, follow-up tomorrow) so the team can call back;
-    the same glczone lead sent again only refreshes its details and never resets a status the team has already changed."""
+    the same glczone lead sent again only refreshes its details and never resets a status the team has already changed.
+    When the website's review workflow moves the application along it sends a "stage" (one of CAREER_STAGES, already mapped from
+    the website status); only then is the CRM lead's status set to it, so the CRM follows the review."""
     secret = request.headers.get("X-Crm-Bridge-Secret", "")
     expected = os.getenv("CRM_BRIDGE_SECRET", "")
     if not expected or not hmac.compare_digest(secret.encode(), expected.encode()):
@@ -1978,6 +1981,8 @@ async def career_lead_webhook(request: Request):
     name = str(body.get("name", "")).strip()
     phone = str(body.get("phone", "")).strip()
     kind = str(body.get("type", "")).strip().lower()
+    stage = str(body.get("stage") or "").strip().upper()
+    stage = stage if stage in CAREER_STAGES else None
     if not lead_id or not name or not phone:
         raise HTTPException(400, "lead_id, name and phone are required")
     label = CAREER_LEAD_LABELS.get(kind, "Career")
@@ -1992,6 +1997,10 @@ async def career_lead_webhook(request: Request):
         for k, v in details.items():
             if v not in (None, "", []):
                 lines.append(f"{str(k).replace('_', ' ').title()}: {v}")
+    review = [f"Review stage: {body.get('stage_label')}" if body.get("stage_label") else None,
+              f"Reviewer: {body.get('assignee')}" if body.get("assignee") else None,
+              f"Interview: {body.get('interview_at')} ({body.get('interview_mode') or '-'}) {body.get('interview_place') or ''}".strip() if body.get("interview_at") else None]
+    lines += [x for x in review if x]
     notes = "\n".join(lines)
 
     tags = ["career", kind or "career"]
@@ -2010,19 +2019,25 @@ async def career_lead_webhook(request: Request):
         "glczone_lead_id": lead_id,
         "updatedAt": now_iso(),
     }
+    if stage:
+        data["status"] = stage
+    if body.get("interview_at"):
+        data["followUpDate"] = str(body.get("interview_at"))[:10]
     existing = await db.leads.find_one({"glczone_lead_id": lead_id}, {"_id": 0, "id": 1})
     if existing:
         await db.leads.update_one({"glczone_lead_id": lead_id}, {"$set": data})
+        if stage:
+            await db.leads.update_one({"glczone_lead_id": lead_id}, {"$push": {"activities": {"id": uid(), "type": "note", "text": f"Website review: {body.get('stage_label') or stage}", "by": "glczone.in", "at": now_iso()}}})
         return {"ok": True, "id": existing["id"], "created": False}
 
     data.update({
         "id": uid(),
         "company": None,
-        "status": "NEW",
+        "status": stage or "NEW",
         "score": 0,
         "value": 0,
         "assignedTo": None,
-        "followUpDate": (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat(),
+        "followUpDate": data.get("followUpDate") or (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat(),
         "createdAt": now_iso(),
         "activities": [{"id": uid(), "type": "note", "text": f"Website par {label} ke liye apply kiya. Call back karna hai.", "by": "glczone.in", "at": now_iso()}],
     })
