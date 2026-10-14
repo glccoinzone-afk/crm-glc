@@ -22,6 +22,7 @@ from pymongo import ReturnDocument
 import glc_finance as gf
 import wa_crm
 import channels_hub
+import zara_knowledge
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -3126,6 +3127,7 @@ async def run_ai_reply(contact: dict, conversation: dict, incoming_text: str, la
                 "\n- Use emojis occasionally to keep tone friendly"
                 "\n- NEVER take or process a new order yourself in this chat, and never ask for product/quantity details to build an order — "
                 "if the customer wants to buy something or place a new order, tell them to visit glczone.in, log in, and order there"
+                + zara_knowledge.prompt_block()
             )
         }
     ]
@@ -4172,6 +4174,7 @@ async def webchat_incoming(request: Request):
                 "\n- Delivery: ₹20 flat upto 15kg, ₹2/kg above"
                 "\n- Time: 30-60 min delivery"
                 "\n- Payment: COD/UPI/Card/Wallet"
+                + zara_knowledge.prompt_block()
             )
         }]
         for m in recent_msgs:
