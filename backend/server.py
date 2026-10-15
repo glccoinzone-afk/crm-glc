@@ -141,6 +141,68 @@ async def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)) -> 
     return user
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def ist_now() -> datetime:
+    return datetime.now(IST)
+
+
+def ist_range(start: datetime, end: datetime) -> dict:
+    """A Mongo range for rows stored as UTC ISO text, from Indian-time start (included) to end (excluded)."""
+    return {"$gte": start.astimezone(timezone.utc).isoformat(), "$lt": end.astimezone(timezone.utc).isoformat()}
+
+
+def ist_day_range(day: str) -> dict:
+    d = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=IST)
+    return ist_range(d, d + timedelta(days=1))
+
+
+def ist_month_range(month: str) -> dict:
+    y, m = int(month[:4]), int(month[5:7])
+    start = datetime(y, m, 1, tzinfo=IST)
+    end = datetime(y + (m == 12), 1 if m == 12 else m + 1, 1, tzinfo=IST)
+    return ist_range(start, end)
+
+
+async def next_doc_number(key: str, collection, prefix: str) -> str:
+    """Next number of a document series (QT, SO, PO, TKT, EMP). Atomic: two requests at the same moment never get the same number,
+    and deleting a record never makes a number come back. The first use continues from the records that already exist."""
+    cid = f"doc:{key}"
+    if not await db.counters.find_one({"_id": cid}, {"_id": 1}):
+        await db.counters.update_one({"_id": cid}, {"$setOnInsert": {"seq": await collection.count_documents({}) + 1000}}, upsert=True)
+    d = await db.counters.find_one_and_update({"_id": cid}, {"$inc": {"seq": 1}}, return_document=ReturnDocument.AFTER)
+    return f"{prefix}-{datetime.now(timezone(timedelta(hours=5, minutes=30))).year}-{d['seq']}"
+
+
+async def take_stock(items: List[dict]) -> List[tuple]:
+    """Takes the stock of order lines. A product that has stock rows must have enough in one of them, or nothing is taken and the
+    request fails (stock never goes below zero). A product with no stock row is not tracked and is skipped. Returns what was taken."""
+    taken: List[tuple] = []
+    for it in items:
+        pid, qty = it.get("productId"), float(it.get("qty") or 0)
+        if not pid or qty <= 0:
+            continue
+        if not await db.stock_items.find_one({"productId": pid}, {"_id": 1}):
+            continue
+        r = await db.stock_items.update_one({"productId": pid, "qty": {"$gte": qty}}, {"$inc": {"qty": -qty}})
+        if r.modified_count != 1:
+            await put_back_stock([{"productId": t[0], "qty": t[1]} for t in taken])
+            have = sum(x.get("qty", 0) for x in await db.stock_items.find({"productId": pid}, {"_id": 0, "qty": 1}).to_list(50))
+            raise HTTPException(status_code=409, detail=f"Not enough stock for {it.get('name') or pid}: {have:g} in stock, {qty:g} needed")
+        taken.append((pid, qty))
+    return taken
+
+
+async def put_back_stock(items: List[dict]):
+    for it in items:
+        pid, qty = it.get("productId"), float(it.get("qty") or 0)
+        if pid and qty > 0:
+            row = await db.stock_items.find_one({"productId": pid}, {"_id": 0, "id": 1})
+            if row:
+                await db.stock_items.update_one({"id": row["id"]}, {"$inc": {"qty": qty}})
+
+
 def _module_allowed(perms: List[str], module: str) -> bool:
     """Same rule the screens use: "*" is everything, "crm" covers "crm.leads", and "crm.leads" is exactly that page."""
     if "*" in perms:
@@ -602,9 +664,24 @@ async def add_lead_activity(lead_id: str, body: Dict[str, Any], user=Depends(cur
 
 @api.post("/leads/{lead_id}/convert")
 async def convert_lead(lead_id: str, user=Depends(require_module("crm.leads"))):
-    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    # claim the lead first: pressing Convert twice does not make two customers
+    lead = await db.leads.find_one_and_update({"id": lead_id, "convertedCustomerId": {"$exists": False}}, {"$set": {"status": "WON", "convertedCustomerId": "pending"}})
+    if lead:
+        lead.pop("_id", None)
     if not lead:
-        raise HTTPException(404, "Not found")
+        existing = await db.leads.find_one({"id": lead_id}, {"_id": 0, "convertedCustomerId": 1})
+        if not existing:
+            raise HTTPException(404, "Not found")
+        done = await db.customers.find_one({"id": existing.get("convertedCustomerId")}, {"_id": 0})
+        if done:
+            return clean(done)
+        raise HTTPException(409, "This lead is being converted")
+    phone10 = re.sub(r"\D", "", lead.get("phone") or "")[-10:]
+    same = await db.customers.find_one({"phone": {"$regex": re.escape(phone10) + "$"}}, {"_id": 0}) if len(phone10) == 10 else None
+    if same:   # the person is already a customer: link, do not create a second one
+        await db.leads.update_one({"id": lead_id}, {"$set": {"status": "WON", "convertedCustomerId": same["id"]}})
+        await log_activity(user["id"], "leads", "convert", lead_id, {"customerId": same["id"], "linkedExisting": True})
+        return clean(same)
     cust = {
         "id": uid(),
         "name": lead.get("name"),
@@ -736,11 +813,11 @@ class QuoteItem(BaseModel):
     productId: Optional[str] = None
     name: str
     hsn: Optional[str] = None
-    qty: float = 1
-    rate: float = 0
-    discount: float = 0
-    discountAmount: float = 0
-    gstRate: float = 18
+    qty: float = Field(1, gt=0, le=1_000_000)          # a zero or negative quantity would add stock
+    rate: float = Field(0, ge=0, le=100_000_000)
+    discount: float = Field(0, ge=0, le=100)
+    discountAmount: float = Field(0, ge=0, le=100_000_000)
+    gstRate: float = Field(18, ge=0, le=100)
     taxInclusive: bool = False
 
 
@@ -771,11 +848,10 @@ async def create_quote(data: QuoteIn, user=Depends(current_user)):
     items = [i.model_dump() for i in data.items]
     intra = gf.is_intra_state(data.customerGst, data.customerState)
     totals = calc_gst(items, intra_state=intra)
-    count = await db.quotations.count_documents({})
     doc = {
         **data.model_dump(),
         "id": uid(),
-        "quoteNo": f"QT-{datetime.now().year}-{count+1001}",
+        "quoteNo": await next_doc_number("QT", db.quotations, "QT"),
         "items": items,
         **totals,
         "createdAt": now_iso(),
@@ -1081,13 +1157,22 @@ async def email_quote(qid: str, user=Depends(current_user)):
 
 @api.post("/quotations/{qid}/convert")
 async def convert_quote_to_order(qid: str, user=Depends(require_module("crm.quotations"))):
-    q = await db.quotations.find_one({"id": qid}, {"_id": 0})
+    # claim the quote first: a second click or a retry finds it already converted and creates nothing
+    q = await db.quotations.find_one_and_update({"id": qid, "status": {"$ne": "CONVERTED"}}, {"$set": {"status": "CONVERTED"}}, return_document=ReturnDocument.AFTER)
+    if q:
+        q.pop("_id", None)
     if not q:
+        if await db.quotations.find_one({"id": qid}, {"_id": 1}):
+            raise HTTPException(409, "This quotation was already converted to an order")
         raise HTTPException(404, "Not found")
-    count = await db.sales_orders.count_documents({})
+    try:
+        taken = await take_stock(q.get("items", []))
+    except Exception:
+        await db.quotations.update_one({"id": qid}, {"$set": {"status": "SENT"}})
+        raise
     order = {
         "id": uid(),
-        "orderNo": f"SO-{datetime.now().year}-{count+1001}",
+        "orderNo": await next_doc_number("SO", db.sales_orders, "SO"),
         "customerId": q.get("customerId"),
         "customerName": q["customerName"],
         "customerGst": q.get("customerGst"),
@@ -1102,15 +1187,17 @@ async def convert_quote_to_order(qid: str, user=Depends(require_module("crm.quot
         "store": q.get("vertical") or "GLC Zone",
         "vertical": q.get("vertical"),
         "quotationId": qid,
+        "stockTaken": [{"productId": t[0], "qty": t[1]} for t in taken],
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
     }
-    await db.sales_orders.insert_one(order)
-    await db.quotations.update_one({"id": qid}, {"$set": {"status": "CONVERTED", "orderId": order["id"]}})
-    # deduct stock
-    for it in q["items"]:
-        if it.get("productId"):
-            await db.stock_items.update_one({"productId": it["productId"]}, {"$inc": {"qty": -it["qty"]}})
+    try:
+        await db.sales_orders.insert_one(order)
+    except Exception:
+        await put_back_stock([{"productId": t[0], "qty": t[1]} for t in taken])
+        await db.quotations.update_one({"id": qid}, {"$set": {"status": "SENT"}})
+        raise
+    await db.quotations.update_one({"id": qid}, {"$set": {"orderId": order["id"]}})
     await log_activity(user["id"], "quotations", "convert-to-order", qid, {"orderId": order["id"]})
     return clean(order)
 
@@ -1145,13 +1232,10 @@ async def create_order(data: OrderIn, user=Depends(current_user)):
     items = [i.model_dump() for i in data.items]
     intra = gf.is_intra_state(data.customerGst, data.customerState)
     totals = calc_gst(items, intra_state=intra)
-    count = await db.sales_orders.count_documents({})
-    doc = {**data.model_dump(), "id": uid(), "orderNo": f"SO-{datetime.now().year}-{count+1001}", "items": items, **totals, "createdAt": now_iso(), "updatedAt": now_iso()}
+    taken = await take_stock(items) if data.status == "CONFIRMED" else []
+    doc = {**data.model_dump(), "id": uid(), "orderNo": await next_doc_number("SO", db.sales_orders, "SO"), "items": items, **totals,
+           "stockTaken": [{"productId": t[0], "qty": t[1]} for t in taken], "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.sales_orders.insert_one(doc)
-    if doc["status"] == "CONFIRMED":
-        for it in items:
-            if it.get("productId"):
-                await db.stock_items.update_one({"productId": it["productId"]}, {"$inc": {"qty": -it["qty"]}})
     await log_activity(user["id"], "orders", "create", doc["id"])
     return clean(doc)
 
@@ -1167,7 +1251,16 @@ async def get_order(oid: str, user=Depends(current_user)):
 @api.put("/orders/{oid}")
 async def update_order(oid: str, body: Dict[str, Any], user=Depends(require_module("sales.orders"))):
     body = safe_fields(body)
+    body.pop("stockTaken", None)
     body["updatedAt"] = now_iso()
+    prev = await db.sales_orders.find_one({"id": oid}, {"_id": 0})
+    if prev and body.get("status") and body["status"] != prev.get("status"):
+        if body["status"] == "CANCELLED" and prev.get("stockTaken"):
+            await put_back_stock(prev["stockTaken"])       # a cancelled order gives its stock back
+            body["stockTaken"] = []
+        elif body["status"] == "CONFIRMED" and not prev.get("stockTaken") and prev.get("items") and not prev.get("glczone_order_id"):
+            taken = await take_stock(prev["items"])
+            body["stockTaken"] = [{"productId": t[0], "qty": t[1]} for t in taken]
     await db.sales_orders.update_one({"id": oid}, {"$set": body})
     d = await db.sales_orders.find_one({"id": oid}, {"_id": 0})
     return d
@@ -1175,6 +1268,12 @@ async def update_order(oid: str, body: Dict[str, Any], user=Depends(require_modu
 
 @api.delete("/orders/{oid}")
 async def delete_order(oid: str, user=Depends(require_delete("sales.orders"))):
+    o = await db.sales_orders.find_one({"id": oid}, {"_id": 0})
+    if o:
+        if await db.invoices.find_one({"orderId": oid, "status": {"$ne": "CANCELLED"}}, {"_id": 1}):
+            raise HTTPException(409, "This order has an invoice. Cancel the invoice first.")
+        if o.get("stockTaken"):
+            await put_back_stock(o["stockTaken"])
     await db.sales_orders.delete_one({"id": oid})
     return {"ok": True}
 
@@ -1236,6 +1335,15 @@ async def generate_invoice(oid: str, request: Request, user=Depends(current_user
     delivered = str(o.get("glczone_status") or o.get("status") or "").lower() == "delivered"
     prepaid = str(o.get("paymentStatus") or "").upper() in ("PAID", "SUCCESS", "COMPLETED", "CAPTURED")
     paid_now = prepaid or (method in ("COD", "CASH") and delivered)      # COD cash is collected at the door
+    # claim the order before taking an invoice number: two clicks at once make one invoice and leave no gap in the numbers
+    claim = await db.sales_orders.find_one_and_update({"id": oid, "invoiceClaim": {"$exists": False}}, {"$set": {"invoiceClaim": now_iso()}})
+    if not claim:
+        for _ in range(10):
+            ex = await db.invoices.find_one({"orderId": oid}, {"_id": 0})
+            if ex:
+                return ex
+            await asyncio.sleep(0.3)
+        raise HTTPException(409, "An invoice for this order is being created. Please refresh in a moment.")
     inv_no = gf.doc_number("INV", await next_seq("INV"))
     inv = {
         "id": uid(),
@@ -1266,7 +1374,11 @@ async def generate_invoice(oid: str, request: Request, user=Depends(current_user
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
     }
-    await db.invoices.insert_one(inv)
+    try:
+        await db.invoices.insert_one(inv)
+    except Exception:
+        await db.sales_orders.update_one({"id": oid}, {"$unset": {"invoiceClaim": ""}})   # nothing was made: the order can be invoiced again
+        raise
     await post_journal(f"Invoice {inv_no}", gf.journal_for_invoice(inv), "INV", inv["id"], user)
     if paid_now:
         pay = {"id": uid(), "invoiceId": inv["id"], "customerId": inv.get("customerId"), "amount": t["total"],
@@ -1325,11 +1437,16 @@ async def add_payment(data: PaymentIn, user=Depends(finance_user)):
         "date": data.date or now_iso(),
         "createdAt": now_iso(),
     }
-    await db.payments.insert_one(pay)
-    new_paid = (inv.get("paidAmount", 0) or 0) + data.amount
+    new_paid = round((inv.get("paidAmount", 0) or 0) + data.amount, 2)
     new_due = max(round(inv["total"] - new_paid - (inv.get("creditedAmount") or 0), 2), 0)
     status_ = "PAID" if new_due <= 0.01 else ("PARTIAL" if new_paid > 0 else "UNPAID")
-    await db.invoices.update_one({"id": data.invoiceId}, {"$set": {"paidAmount": new_paid, "dueAmount": new_due, "status": status_, "updatedAt": now_iso()}})
+    # the invoice is updated only if nobody changed it since it was read: two payments at the same moment cannot both pass
+    same_as_read = {"paidAmount": inv["paidAmount"]} if "paidAmount" in inv else {"paidAmount": {"$exists": False}}
+    won = await db.invoices.find_one_and_update({"id": data.invoiceId, "status": {"$ne": "CANCELLED"}, **same_as_read},
+                                                {"$set": {"paidAmount": new_paid, "dueAmount": new_due, "status": status_, "updatedAt": now_iso()}})
+    if not won:
+        raise HTTPException(409, "The invoice changed while saving. Please refresh and enter the payment again.")
+    await db.payments.insert_one(pay)
     await post_journal(f"Payment for {inv.get('invoiceNo')}", gf.journal_for_payment(data.amount, data.method), "PAY", pay["id"], user)
     await log_activity(user["id"], "payments", "create", pay["id"], {"invoiceId": data.invoiceId})
     return clean(pay)
@@ -1523,8 +1640,7 @@ async def create_po(data: POIn, user=Depends(current_user)):
     sup = await db.suppliers.find_one({"id": data.supplierId}, {"_id": 0}) or {}
     intra = gf.is_intra_state(sup.get("gst"), sup.get("state"))
     totals = calc_gst(items, intra_state=intra)
-    count = await db.purchase_orders.count_documents({})
-    doc = {**data.model_dump(), "id": uid(), "poNo": f"PO-{datetime.now().year}-{count+1001}", "items": items, **totals,
+    doc = {**data.model_dump(), "id": uid(), "poNo": await next_doc_number("PO", db.purchase_orders, "PO"), "items": items, **totals,
            "supplierGst": sup.get("gst") or "", "itcEligible": gf.valid_gstin(sup.get("gst")), "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.purchase_orders.insert_one(doc)
     return clean(doc)
@@ -1631,8 +1747,9 @@ async def list_employees(page: int = 1, limit: int = 100, q: Optional[str] = Non
 
 @api.post("/employees")
 async def create_employee(data: EmployeeIn, user=Depends(require_module("hr.employees"))):
-    count = await db.employees.count_documents({})
-    doc = {**data.model_dump(), "id": uid(), "employeeId": data.employeeId or f"GLC{1000+count+1}", "createdAt": now_iso(), "updatedAt": now_iso()}
+    if not data.employeeId:
+        seq = (await next_doc_number("EMP", db.employees, "GLC")).rsplit("-", 1)[-1]
+    doc = {**data.model_dump(), "id": uid(), "employeeId": data.employeeId or f"GLC{seq}", "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.employees.insert_one(doc)
     return clean(doc)
 
@@ -1662,6 +1779,8 @@ class AttendanceIn(BaseModel):
 async def list_attendance(month: Optional[str] = None, employeeId: Optional[str] = None, user=Depends(current_user)):
     filt = {}
     if month:
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            raise HTTPException(400, "month must look like 2026-09")
         filt["date"] = {"$regex": f"^{month}"}
     if employeeId:
         filt["employeeId"] = employeeId
@@ -1816,7 +1935,7 @@ async def create_journal(data: JournalIn, user=Depends(finance_user)):
 def _month_filter(field: str, month: Optional[str]) -> dict:
     if month and not re.match(r"^\d{4}-\d{2}$", month):
         raise HTTPException(400, "month must look like 2026-09")
-    return {field: {"$regex": f"^{month}"}} if month else {}
+    return {field: ist_month_range(month)} if month else {}   # months are Indian months; rows are stored in UTC
 
 
 @api.get("/reports/gst")
@@ -1984,8 +2103,8 @@ async def list_tickets(page: int = 1, limit: int = 50, q: Optional[str] = None, 
 
 @api.post("/tickets")
 async def create_ticket(data: TicketIn, user=Depends(current_user)):
-    count = await db.tickets.count_documents({})
-    doc = {**data.model_dump(), "id": uid(), "ticketNo": f"TKT-{count+1001:04d}", "replies": [], "createdAt": now_iso(), "updatedAt": now_iso()}
+    seq = (await next_doc_number("TKT", db.tickets, "TKT")).rsplit("-", 1)[-1]
+    doc = {**data.model_dump(), "id": uid(), "ticketNo": f"TKT-{int(seq):04d}", "replies": [], "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.tickets.insert_one(doc)
     return clean(doc)
 
@@ -2344,10 +2463,37 @@ async def call_glczone_bridge(path: str, data: dict):
                 headers={"X-Crm-Bridge-Secret": secret},
                 data=data,
             )
-            return resp.json()
+            try:
+                body = resp.json()
+            except Exception:
+                return {"error": True, "message": f"glczone.in answered with HTTP {resp.status_code} and no JSON"}
+            if resp.status_code >= 400 and not body.get("error"):
+                return {"error": True, "message": body.get("message") or f"glczone.in answered with HTTP {resp.status_code}"}
+            return body
     except Exception as e:
         log.warning(f"CRM bridge call failed ({path}): {e}")
-        return {"error": True, "message": str(e)}
+        return {"error": True, "message": f"Could not reach glczone.in: {e}"}
+
+
+_PENDING = ["pending", "PENDING"]
+
+
+async def claim_for_action(coll, rid: str, allowed: List[str], not_found: str) -> dict:
+    """Moves a withdrawal / return from one of the allowed states to "processing" in one step, so a double click, a retry or two staff
+    members cannot send the same payout twice. Returns the row as it was before; the caller sets the final state or puts the old one back."""
+    prev = await coll.find_one_and_update({"id": rid, "status": {"$in": allowed}}, {"$set": {"status": "processing", "updatedAt": now_iso()}},
+                                          return_document=ReturnDocument.BEFORE)
+    if prev:
+        prev.pop("_id", None)
+        return prev
+    row = await coll.find_one({"id": rid}, {"_id": 0, "status": 1})
+    if not row:
+        raise HTTPException(404, not_found)
+    raise HTTPException(409, f"This request is already {row.get('status')}" if row.get("status") != "processing" else "This request is being processed right now")
+
+
+async def release_claim(coll, rid: str, prev_status: str, error: str):
+    await coll.update_one({"id": rid}, {"$set": {"status": prev_status, "lastBridgeError": error, "updatedAt": now_iso()}})
 
 
 @api.get("/withdrawals")
@@ -2363,45 +2509,39 @@ async def list_withdrawals(page: int = 1, limit: int = 50, status_: Optional[str
 
 @api.post("/withdrawals/{wid}/approve")
 async def approve_withdrawal(wid: str, user=Depends(require_module("*"))):
-    w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
-    if not w:
-        raise HTTPException(404, "Withdrawal not found")
-
+    w = await claim_for_action(db.withdrawals, wid, _PENDING, "Withdrawal not found")
     result = await call_glczone_bridge(f"withdrawals/{w['glczone_withdrawal_id']}/approve", {})
     if result.get("error"):
+        await release_claim(db.withdrawals, wid, w.get("status", "pending"), str(result.get("message")))
         raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
 
-    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "approved", "updatedAt": now_iso()}})
+    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "approved", "updatedAt": now_iso(), "decidedBy": user.get("name")}, "$unset": {"lastBridgeError": ""}})
     return {"ok": True, "message": "Withdrawal approved on glczone.in and CRM"}
 
 
 @api.post("/withdrawals/{wid}/reject")
 async def reject_withdrawal(wid: str, body: Dict[str, Any], user=Depends(require_module("*"))):
-    w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
-    if not w:
-        raise HTTPException(404, "Withdrawal not found")
-
+    w = await claim_for_action(db.withdrawals, wid, _PENDING, "Withdrawal not found")
     reason = body.get("reason", "")
     result = await call_glczone_bridge(f"withdrawals/{w['glczone_withdrawal_id']}/reject", {"reason": reason})
     if result.get("error"):
+        await release_claim(db.withdrawals, wid, w.get("status", "pending"), str(result.get("message")))
         raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
 
-    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "rejected", "updatedAt": now_iso()}})
+    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "rejected", "updatedAt": now_iso(), "decidedBy": user.get("name")}, "$unset": {"lastBridgeError": ""}})
     return {"ok": True, "message": "Withdrawal rejected and refunded on glczone.in"}
 
 
 @api.post("/withdrawals/{wid}/mark-paid")
 async def mark_withdrawal_paid(wid: str, body: Dict[str, Any], user=Depends(require_module("*"))):
-    w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
-    if not w:
-        raise HTTPException(404, "Withdrawal not found")
-
+    w = await claim_for_action(db.withdrawals, wid, ["approved", "APPROVED"], "Withdrawal not found")   # only an approved withdrawal can be marked paid
     payment_reference = body.get("payment_reference", "")
     result = await call_glczone_bridge(f"withdrawals/{w['glczone_withdrawal_id']}/mark-paid", {"payment_reference": payment_reference})
     if result.get("error"):
+        await release_claim(db.withdrawals, wid, w.get("status", "approved"), str(result.get("message")))
         raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
 
-    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "paid", "updatedAt": now_iso()}})
+    await db.withdrawals.update_one({"id": wid}, {"$set": {"status": "paid", "updatedAt": now_iso(), "decidedBy": user.get("name")}, "$unset": {"lastBridgeError": ""}})
     return {"ok": True, "message": "Withdrawal marked as paid"}
 
 
@@ -2420,10 +2560,7 @@ async def list_returns(page: int = 1, limit: int = 50, status_: Optional[str] = 
 
 @api.post("/returns/{rid}/approve")
 async def approve_return(rid: str, user=Depends(require_module("*"))):
-    r = await db.returns.find_one({"id": rid}, {"_id": 0})
-    if not r:
-        raise HTTPException(404, "Return request not found")
-
+    r = await claim_for_action(db.returns, rid, _PENDING, "Return request not found")
     result = await call_glczone_bridge("returns/update", {
         "return_request_id": r["glczone_return_id"],
         "status": "1",
@@ -2431,18 +2568,16 @@ async def approve_return(rid: str, user=Depends(require_module("*"))):
         "update_remarks": "Approved via CRM",
     })
     if result.get("error"):
+        await release_claim(db.returns, rid, r.get("status", "PENDING"), str(result.get("message")))
         raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
 
-    await db.returns.update_one({"id": rid}, {"$set": {"status": "APPROVED", "updatedAt": now_iso()}})
+    await db.returns.update_one({"id": rid}, {"$set": {"status": "APPROVED", "updatedAt": now_iso(), "decidedBy": user.get("name")}, "$unset": {"lastBridgeError": ""}})
     return {"ok": True, "message": "Return approved on glczone.in and CRM"}
 
 
 @api.post("/returns/{rid}/reject")
 async def reject_return(rid: str, body: Dict[str, Any], user=Depends(require_module("*"))):
-    r = await db.returns.find_one({"id": rid}, {"_id": 0})
-    if not r:
-        raise HTTPException(404, "Return request not found")
-
+    r = await claim_for_action(db.returns, rid, _PENDING, "Return request not found")
     reason = body.get("reason", "")
     result = await call_glczone_bridge("returns/update", {
         "return_request_id": r["glczone_return_id"],
@@ -2451,9 +2586,10 @@ async def reject_return(rid: str, body: Dict[str, Any], user=Depends(require_mod
         "update_remarks": reason,
     })
     if result.get("error"):
+        await release_claim(db.returns, rid, r.get("status", "PENDING"), str(result.get("message")))
         raise HTTPException(400, result.get("message", "glczone.in rejected the request"))
 
-    await db.returns.update_one({"id": rid}, {"$set": {"status": "REJECTED", "updatedAt": now_iso()}})
+    await db.returns.update_one({"id": rid}, {"$set": {"status": "REJECTED", "updatedAt": now_iso(), "decidedBy": user.get("name")}, "$unset": {"lastBridgeError": ""}})
     return {"ok": True, "message": "Return rejected on glczone.in and CRM"}
 
 
@@ -2518,23 +2654,23 @@ async def list_notifications(user=Depends(current_user)):
         alerts.append({"id": "low-stock", "title": "Low Stock Alert", "message": f"{low_stock} product(s) running low on stock", "type": "stock", "isRead": False, "createdAt": now_iso(), "url": "/inventory/stock"})
 
     # 3. Pending withdrawals
-    pending_w = await db.withdrawals.count_documents({"status": "PENDING"})
+    pending_w = await db.withdrawals.count_documents({"status": {"$in": _PENDING}})
     if pending_w > 0:
         alerts.append({"id": "withdrawal-pending", "title": "Withdrawal Requests", "message": f"{pending_w} seller withdrawal(s) pending approval", "type": "withdrawal", "isRead": False, "createdAt": now_iso(), "url": "/sellers"})
 
     # 4. Pending returns
-    pending_r = await db.returns.count_documents({"status": "PENDING"})
+    pending_r = await db.returns.count_documents({"status": {"$in": _PENDING}})
     if pending_r > 0:
         alerts.append({"id": "return-pending", "title": "Return Requests", "message": f"{pending_r} customer return(s) awaiting action", "type": "return", "isRead": False, "createdAt": now_iso(), "url": "/sellers"})
 
     # 5. Unpaid invoices
-    unpaid = await db.invoices.count_documents({"status": {"$in": ["UNPAID", "OVERDUE"]}})
+    unpaid = await db.invoices.count_documents({"status": {"$in": ["UNPAID", "PARTIAL", "OVERDUE"]}})
     if unpaid > 0:
         alerts.append({"id": "unpaid-invoices", "title": "Unpaid Invoices", "message": f"{unpaid} invoice(s) are unpaid or overdue", "type": "invoice", "isRead": False, "createdAt": now_iso(), "url": "/sales/invoices"})
 
     # 6. New leads today
-    today = now_iso()[:10]
-    new_leads = await db.leads.count_documents({"createdAt": {"$regex": f"^{today}"}})
+    today = ist_now().strftime("%Y-%m-%d")
+    new_leads = await db.leads.count_documents({"createdAt": ist_day_range(today)})
     if new_leads > 0:
         alerts.append({"id": "new-leads", "title": "New Leads Today", "message": f"{new_leads} new lead(s) added today", "type": "lead", "isRead": False, "createdAt": now_iso(), "url": "/crm/leads"})
 
@@ -2552,27 +2688,26 @@ async def list_notifications(user=Depends(current_user)):
     stored = await db.notifications.find({"userId": {"$in": [user["id"], "*"]}}, {"_id": 0}).sort("createdAt", -1).limit(20).to_list(20)
 
     # Merge — stored ones first, then live alerts
-    read_ids = {n["id"] for n in stored if n.get("isRead")}
+    # a live alert is read for THIS person until its number changes (or, for new leads, until the next day)
+    reads = {r["alertId"]: r.get("sig") async for r in db.alert_reads.find({"userId": user["id"]}, {"_id": 0})}
     for a in alerts:
-        if a["id"] in read_ids:
-            a["isRead"] = True
+        num = re.match(r"\d+", a.get("message", ""))
+        a["sig"] = f"{a['id']}|{num.group() if num else ''}|{today if a['id'] == 'new-leads' else ''}"
+        a["isRead"] = reads.get(a["id"]) == a["sig"]
 
-    all_items = alerts + [s for s in stored if s.get("id") not in {a["id"] for a in alerts}]
+    live_ids = {a["id"] for a in alerts}
+    all_items = alerts + [s for s in stored if s.get("id") not in live_ids and s.get("title")]
     unread = sum(1 for n in all_items if not n.get("isRead"))
     return {"items": all_items[:30], "unread": unread}
 
 
 @api.put("/notifications/read-all")
 async def mark_all_read(user=Depends(current_user)):
-    await db.notifications.update_many({"userId": {"$in": [user["id"], "*"]}}, {"$set": {"isRead": True}})
-    # Store read state for live alerts
-    live_ids = ["leave-pending","low-stock","withdrawal-pending","return-pending","unpaid-invoices","new-leads","pending-deliveries","due-posts"]
-    for lid in live_ids:
-        existing = await db.notifications.find_one({"id": lid})
-        if existing:
-            await db.notifications.update_one({"id": lid}, {"$set": {"isRead": True}})
-        else:
-            await db.notifications.insert_one({"id": lid, "userId": user["id"], "isRead": True, "createdAt": now_iso()})
+    await db.notifications.update_many({"userId": user["id"]}, {"$set": {"isRead": True}})
+    current = await list_notifications(user)
+    for a in current["items"]:
+        if a.get("sig"):
+            await db.alert_reads.update_one({"userId": user["id"], "alertId": a["id"]}, {"$set": {"sig": a["sig"], "readAt": now_iso()}}, upsert=True)
     return {"ok": True}
 
 
@@ -2680,7 +2815,7 @@ async def update_company(body: Dict[str, Any], user=Depends(require_module("sett
 # =========================================================
 @api.get("/dashboard")
 async def dashboard(vertical: Optional[str] = None, user=Depends(current_user)):
-    now = datetime.now(timezone.utc)
+    now = ist_now()                       # the dashboard speaks Indian time: "today" starts at midnight IST
     today = now.strftime("%Y-%m-%d")
     month = now.strftime("%Y-%m")
 
@@ -2693,11 +2828,11 @@ async def dashboard(vertical: Optional[str] = None, user=Depends(current_user)):
     # today revenue
     today_rev = 0.0
     today_orders = 0
-    async for o in db.sales_orders.find({**order_filter, "createdAt": {"$regex": f"^{today}"}}, {"_id": 0}):
+    async for o in db.sales_orders.find({**order_filter, "createdAt": ist_day_range(today)}, {"_id": 0}):
         today_rev += o.get("total", 0)
         today_orders += 1
 
-    new_customers = await db.customers.count_documents({"createdAt": {"$regex": f"^{today}"}})
+    new_customers = await db.customers.count_documents({"createdAt": ist_day_range(today)})
     pending_orders = await db.sales_orders.count_documents({**order_filter, "status": {"$in": ["PENDING", "CONFIRMED", "PROCESSING"]}})
 
     unpaid_amt = 0.0
@@ -2714,21 +2849,22 @@ async def dashboard(vertical: Optional[str] = None, user=Depends(current_user)):
     # 6-month revenue
     rev_series = []
     for i in range(5, -1, -1):
-        m = (now.replace(day=1) - timedelta(days=30 * i)).strftime("%Y-%m")
+        idx = now.year * 12 + (now.month - 1) - i          # exact calendar months, never a skipped or repeated one
+        m = f"{idx // 12}-{idx % 12 + 1:02d}"
         total = 0.0
-        async for o in db.sales_orders.find({**order_filter, "createdAt": {"$regex": f"^{m}"}}, {"_id": 0}):
+        async for o in db.sales_orders.find({**order_filter, "createdAt": ist_month_range(m)}, {"_id": 0}):
             total += o.get("total", 0)
         rev_series.append({"month": m, "revenue": round(total, 2)})
 
     # sales by store/vertical
     sbv: Dict[str, float] = {}
-    async for o in db.sales_orders.find({}, {"_id": 0}):
+    async for o in db.sales_orders.find(order_filter, {"_id": 0}):       # the vertical filter applies here too
         k = o.get("vertical") or o.get("store") or "Other"
         sbv[k] = sbv.get(k, 0) + o.get("total", 0)
     sales_by_vertical = [{"name": k, "value": round(v, 2)} for k, v in sbv.items()]
 
     # lead funnel
-    stages = ["NEW", "CONTACTED", "QUALIFIED", "PROPOSAL", "NEGOTIATION", "WON"]
+    stages = ["NEW", "CONTACTED", "QUALIFIED", "PROPOSAL", "NEGOTIATION", "WON", "LOST"]
     funnel = []
     for s in stages:
         c = await db.leads.count_documents({"status": s})
@@ -4901,6 +5037,47 @@ async def scheduled_posts_worker():
         await asyncio.sleep(60)
 
 
+def _present(field: str) -> dict:
+    return {"partialFilterExpression": {field: {"$type": "string"}}}
+
+
+async def ensure_indexes():
+    """Indexes for lookups and for the rules the data must follow (no two invoices for one order, no repeated numbers).
+    Each one is created on its own: if old data already breaks a unique rule the index is skipped and logged, nothing else fails."""
+    plan = [
+        ("audit_logs", [("createdAt", -1)], {}), ("audit_logs", [("userId", 1), ("createdAt", -1)], {}), ("audit_logs", [("module", 1), ("createdAt", -1)], {}),
+        ("login_attempts", [("expireAt", 1)], {"expireAfterSeconds": 0}),
+        ("users", [("id", 1)], {"unique": True}), ("users", [("email", 1)], {}),
+        ("leads", [("id", 1)], {"unique": True}), ("leads", [("glczone_lead_id", 1)], {"unique": True, **_present("glczone_lead_id")}),
+        ("leads", [("phone", 1)], {}), ("leads", [("status", 1), ("createdAt", -1)], {}),
+        ("customers", [("id", 1)], {"unique": True}), ("customers", [("phone", 1)], {}),
+        ("customers", [("glczone_user_id", 1)], {"unique": True, **_present("glczone_user_id")}),
+        ("quotations", [("id", 1)], {"unique": True}), ("quotations", [("quoteNo", 1)], {"unique": True, **_present("quoteNo")}),
+        ("sales_orders", [("id", 1)], {"unique": True}), ("sales_orders", [("orderNo", 1)], {}),
+        ("sales_orders", [("glczone_order_id", 1)], {"unique": True, **_present("glczone_order_id")}),
+        ("sales_orders", [("status", 1), ("createdAt", -1)], {}),
+        ("invoices", [("id", 1)], {"unique": True}), ("invoices", [("invoiceNo", 1)], {"unique": True, **_present("invoiceNo")}),
+        ("invoices", [("orderId", 1)], {"unique": True, **_present("orderId")}), ("invoices", [("status", 1)], {}),
+        ("payments", [("invoiceId", 1)], {}),
+        ("deals", [("id", 1)], {"unique": True}), ("deals", [("glczone_order_id", 1)], {"unique": True, **_present("glczone_order_id")}),
+        ("deliveries", [("glczone_order_id", 1)], {}),
+        ("products", [("id", 1)], {"unique": True}), ("stock_items", [("productId", 1)], {}),
+        ("purchase_orders", [("poNo", 1)], {"unique": True, **_present("poNo")}), ("tickets", [("ticketNo", 1)], {"unique": True, **_present("ticketNo")}),
+        ("withdrawals", [("id", 1)], {}), ("returns", [("id", 1)], {}),
+        ("ocm_contacts", [("phone", 1)], {}), ("ocm_contacts", [("whatsappId", 1)], {}),
+        ("ocm_conversations", [("contactId", 1)], {}), ("ocm_conversations", [("lastMessageAt", -1)], {}),
+        ("ocm_messages", [("conversationId", 1), ("createdAt", 1)], {}),
+    ]
+    made = 0
+    for coll, keys, kw in plan:
+        try:
+            await db[coll].create_index(keys, **kw)
+            made += 1
+        except Exception as e:
+            log.warning(f"Index {coll}{keys} skipped: {e}")
+    log.info(f"Indexes ready ({made} of {len(plan)})")
+
+
 @app.on_event("startup")
 async def startup_seed():
     from seed import seed_all
@@ -4918,12 +5095,7 @@ async def startup_seed():
         await ensure_finance_accounts()
     except Exception as e:
         log.warning(f"Finance accounts check failed: {e}")
-    try:
-        await db.audit_logs.create_index([("createdAt", -1)])
-        await db.audit_logs.create_index([("userId", 1), ("createdAt", -1)])
-        await db.audit_logs.create_index([("module", 1), ("createdAt", -1)])
-    except Exception as e:
-        log.warning(f"Audit index creation failed: {e}")
+    asyncio.create_task(ensure_indexes())
     asyncio.create_task(scheduled_posts_worker())
     log.info("Scheduled posts worker started")
 

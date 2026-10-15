@@ -21,15 +21,24 @@ import server  # noqa: E402
 
 @pytest.fixture(scope="module")
 def api():
+    saved_db = server.db
+    server.db = AsyncMongoMockClient()["glc_sec_isolated"]          # own empty database: other test files keep their own state
+    try:
+        yield from _client()
+    finally:
+        server.db = saved_db
+
+
+def _client():
     with TestClient(server.app) as c:
         run = c.portal.call
         secret = pyotp.random_base32()
         users = [
-            {"id": "u-admin", "name": "Admin", "email": "admin@x.in", "role": "Admin", "password": server.hash_pw("Pass#1234"), "totp_secret": secret, "twofa_enabled": False},
-            {"id": "u-tele", "name": "Tele", "email": "tele@x.in", "role": "Telecaller", "password": server.hash_pw("Pass#1234")},
-            {"id": "u-hr", "name": "HR", "email": "hr@x.in", "role": "HR", "password": server.hash_pw("Pass#1234")},
-            {"id": "u-2fa", "name": "TwoFA", "email": "two@x.in", "role": "Admin", "password": server.hash_pw("Pass#1234"), "totp_secret": secret, "twofa_enabled": True},
-            {"id": "u-off", "name": "Off", "email": "off@x.in", "role": "Admin", "password": server.hash_pw("Pass#1234"), "isActive": False},
+            {"id": "sec-admin", "name": "Admin", "email": "admin@x.in", "role": "Admin", "password": server.hash_pw("Pass#1234"), "totp_secret": secret, "twofa_enabled": False},
+            {"id": "sec-tele", "name": "Tele", "email": "tele@x.in", "role": "Telecaller", "password": server.hash_pw("Pass#1234")},
+            {"id": "sec-hr", "name": "HR", "email": "hr@x.in", "role": "HR", "password": server.hash_pw("Pass#1234")},
+            {"id": "sec-2fa", "name": "TwoFA", "email": "two@x.in", "role": "Admin", "password": server.hash_pw("Pass#1234"), "totp_secret": secret, "twofa_enabled": True},
+            {"id": "sec-off", "name": "Off", "email": "off@x.in", "role": "Admin", "password": server.hash_pw("Pass#1234"), "isActive": False},
         ]
         for u in users:
             run(server.db.users.insert_one, u)
@@ -55,7 +64,7 @@ def test_2fa_step_one_token_is_not_a_login(api):
 
 
 def test_a_normal_token_cannot_be_used_as_the_2fa_step(api):
-    normal = server.make_token("u-2fa", "two@x.in", "Admin")
+    normal = server.make_token("sec-2fa", "two@x.in", "Admin")
     r = api.post("/api/auth/2fa/verify", json={"temp_token": normal, "code": pyotp.TOTP(api.secret).now()})
     assert r.status_code == 401
 
@@ -69,11 +78,11 @@ def test_login_locks_after_five_wrong_passwords(api):
 
 
 def test_disabled_user_token_stops_working(api):
-    assert api.get("/api/auth/me", headers=api.h("u-off", "Admin")).status_code == 403
+    assert api.get("/api/auth/me", headers=api.h("sec-off", "Admin")).status_code == 403
 
 
 def test_2fa_secrets_are_never_returned(api):
-    h = api.h("u-admin", "Admin")
+    h = api.h("sec-admin", "Admin")
     me = api.get("/api/auth/me", headers=h).json()
     assert "totp_secret" not in me and "totp_secret_pending" not in me and "password" not in me
     users = api.get("/api/users", headers=h).json()["items"]
@@ -83,7 +92,7 @@ def test_2fa_secrets_are_never_returned(api):
 
 
 def test_telecaller_cannot_do_admin_things(api):
-    t = api.h("u-tele", "Telecaller")
+    t = api.h("sec-tele", "Telecaller")
     assert api.get("/api/users", headers=t).status_code == 403
     assert api.get("/api/payroll", headers=t).status_code == 403
     assert api.get("/api/employees", headers=t).status_code == 403
@@ -97,7 +106,7 @@ def test_telecaller_cannot_do_admin_things(api):
 
 
 def test_hr_can_run_hr_but_not_money(api):
-    h = api.h("u-hr", "HR")
+    h = api.h("sec-hr", "HR")
     assert api.get("/api/employees", headers=h).status_code == 200
     assert api.get("/api/payroll", headers=h).status_code == 200
     assert api.post("/api/withdrawals/x/approve", headers=h).status_code == 403
@@ -105,13 +114,13 @@ def test_hr_can_run_hr_but_not_money(api):
 
 
 def test_admin_is_allowed(api):
-    a = api.h("u-admin", "Admin")
+    a = api.h("sec-admin", "Admin")
     assert api.get("/api/users", headers=a).status_code == 200
     assert api.get("/api/audit", headers=a).status_code == 200
 
 
 def test_update_cannot_change_id_or_use_operators(api):
-    a = api.h("u-admin", "Admin")
+    a = api.h("sec-admin", "Admin")
     api.run(server.db.tasks.insert_one, {"id": "t1", "title": "A", "status": "TODO"})
     r = api.put("/api/tasks/t1", json={"id": "hacked", "title": "B", "$set": {"x": 1}, "a.b": 2}, headers=a)
     assert r.status_code == 200
@@ -120,7 +129,7 @@ def test_update_cannot_change_id_or_use_operators(api):
 
 
 def test_search_with_special_characters_does_not_crash(api):
-    t = api.h("u-tele", "Telecaller")
+    t = api.h("sec-tele", "Telecaller")
     for q in ["+91", "(", "98*", "[a-", "\\"]:
         assert api.get("/api/leads", params={"q": q}, headers=t).status_code == 200
 
