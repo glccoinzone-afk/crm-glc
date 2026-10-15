@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Plus, FolderKanban, LifeBuoy, FileArchive, ScrollText, Trash2 } from "lucide-react";
 import { motion } from "framer-motion";
-import api, { fmtDate, fmtInr } from "@/lib/glc";
+import api, { fmtDate, fmtInr, downloadFile } from "@/lib/glc";
 import { PageHeader, DataGrid, StatusBadge, EmptyState } from "@/components/common/GlcUI";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -225,10 +225,9 @@ export function Documents() {
     load();
   };
 
-  const download = (d) => {
-    const token = localStorage.getItem("glc_token");
-    const url = `${process.env.REACT_APP_BACKEND_URL}/api/documents/${d.id}/download?auth=${encodeURIComponent(token)}`;
-    window.open(url, "_blank");
+  const download = async (d) => {
+    try { await downloadFile(`/documents/${d.id}/download`, d.name); }
+    catch { toast.error("Download failed"); }
   };
 
   const CAT_STYLE = { LEGAL: "bg-rose-50 text-rose-700", HR: "bg-emerald-50 text-emerald-700", FINANCE: "bg-amber-50 text-amber-700", VENDOR: "bg-blue-50 text-blue-700", GENERAL: "bg-slate-100 text-slate-700" };
