@@ -163,3 +163,30 @@ export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", 
     </div>
   );
 }
+
+export function Pager({ page, total, limit = 50, onPage, testId = "pager" }) {
+  const pages = Math.max(1, Math.ceil((total || 0) / limit));
+  if ((total || 0) <= limit) return total ? <div data-testid={testId} className="text-[12.5px] text-slate-500">{total} record{total === 1 ? "" : "s"}</div> : null;
+  const from = (page - 1) * limit + 1;
+  const to = Math.min(page * limit, total);
+  return (
+    <div data-testid={testId} className="flex items-center justify-between text-[12.5px] text-slate-600">
+      <span>{from}-{to} of {total}</span>
+      <div className="flex items-center gap-2">
+        <button disabled={page <= 1} onClick={() => onPage(page - 1)} className="px-3 h-9 rounded-lg border border-slate-200 bg-white disabled:opacity-40">Previous</button>
+        <span>Page {page} of {pages}</span>
+        <button disabled={page >= pages} onClick={() => onPage(page + 1)} className="px-3 h-9 rounded-lg border border-slate-200 bg-white disabled:opacity-40">Next</button>
+      </div>
+    </div>
+  );
+}
+
+export function ErrorBanner({ message, onRetry }) {
+  return (
+    <div className="bg-rose-50 border border-rose-200 text-rose-800 rounded-2xl p-5 text-[13px] flex items-center justify-between gap-3">
+      <span>{message}</span>
+      {onRetry && <button onClick={onRetry} className="px-3 h-9 rounded-lg bg-white border border-rose-200 text-[13px] font-medium">Retry</button>}
+    </div>
+  );
+}
+

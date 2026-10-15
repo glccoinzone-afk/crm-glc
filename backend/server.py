@@ -621,19 +621,97 @@ class LeadIn(BaseModel):
     vertical: Optional[str] = None
 
 
+LEAD_STATUSES = ["NEW", "CONTACTED", "QUALIFIED", "PROPOSAL", "NEGOTIATION", "WON", "LOST"]
+LEAD_CLOSED = ["WON", "LOST"]
+
+
+def norm_phone(p: Optional[str]) -> str:
+    """The last 10 digits of a phone number: "+91 98765-43210" and "09876543210" are the same person."""
+    return re.sub(r"\D", "", p or "")[-10:]
+
+
+async def find_duplicate(phone: Optional[str], email: Optional[str], exclude_id: Optional[str] = None) -> Optional[dict]:
+    """An existing lead or customer with the same phone or e-mail, or None."""
+    ph, em = norm_phone(phone), (email or "").strip().lower()
+    for kind, coll in (("lead", db.leads), ("customer", db.customers)):
+        conds = []
+        if len(ph) == 10:
+            conds.append({"phone": {"$regex": r"\D*".join(ph) + r"\D*$"}})    # the 10 digits in order, whatever is written between them
+        if em:
+            conds.append({"email": {"$regex": "^" + re.escape(em) + "$", "$options": "i"}})
+        for c in conds:
+            filt = dict(c)
+            if exclude_id:
+                filt["id"] = {"$ne": exclude_id}
+            d = await coll.find_one(filt, {"_id": 0, "id": 1, "name": 1, "status": 1, "phone": 1})
+            if d:
+                return {"type": kind, "id": d["id"], "name": d.get("name"), "status": d.get("status"), "phone": d.get("phone")}
+    return None
+
+
+def _follow_filters(follow: Optional[str], today: str) -> List[dict]:
+    if follow == "today":
+        return [{"followUpDate": {"$regex": "^" + today}}, {"status": {"$nin": LEAD_CLOSED}}]
+    if follow == "overdue":
+        return [{"followUpDate": {"$lt": today, "$gt": ""}}, {"status": {"$nin": LEAD_CLOSED}}]
+    if follow == "due":     # today or earlier
+        return [{"followUpDate": {"$lt": today + "~", "$gt": ""}}, {"status": {"$nin": LEAD_CLOSED}}]
+    if follow == "none":
+        return [{"followUpDate": {"$in": [None, ""]}}, {"status": {"$nin": LEAD_CLOSED}}]
+    return []
+
+
 @api.get("/leads")
-async def list_leads(page: int = 1, limit: int = 50, q: Optional[str] = None, status_: Optional[str] = Query(None, alias="status"), vertical: Optional[str] = None, user=Depends(current_user)):
-    filt = {}
+async def list_leads(page: int = 1, limit: int = 50, q: Optional[str] = None, status_: Optional[str] = Query(None, alias="status"), vertical: Optional[str] = None,
+                     source: Optional[str] = None, assigned: Optional[str] = None, follow: Optional[str] = None, user=Depends(current_user)):
+    conds: List[dict] = []
     if status_:
-        filt["status"] = status_
+        conds.append({"status": status_})
     if vertical:
-        filt["vertical"] = vertical
-    return await paginate(db.leads, filt, page, limit, search_fields=["name", "email", "phone", "company"], q=q)
+        conds.append({"vertical": vertical})
+    if source:
+        conds.append({"source": source})
+    if assigned == "me":
+        conds.append({"assignedTo": user["id"]})
+    elif assigned == "none":
+        conds.append({"assignedTo": {"$in": [None, ""]}})
+    elif assigned:
+        conds.append({"assignedTo": assigned})
+    today = ist_now().strftime("%Y-%m-%d")
+    conds += _follow_filters(follow, today)
+    filt = {"$and": conds} if conds else {}
+    by_follow = follow in ("today", "overdue", "due")
+    return await paginate(db.leads, filt, max(1, page), max(1, min(limit, 200)), sort_field="followUpDate" if by_follow else "createdAt",
+                          sort_dir=1 if by_follow else -1, search_fields=["name", "email", "phone", "company"], q=q)
+
+
+@api.get("/leads/summary")
+async def leads_summary(user=Depends(current_user)):
+    """The numbers on the Leads page chips: what needs a call today, what is late, what is mine, what nobody owns."""
+    today = ist_now().strftime("%Y-%m-%d")
+    open_ = {"status": {"$nin": LEAD_CLOSED}}
+
+    async def n(extra):
+        return await db.leads.count_documents({"$and": [open_] + extra} if extra else open_)
+    return {
+        "today": await n(_follow_filters("today", today)[:1]),
+        "overdue": await n(_follow_filters("overdue", today)[:1]),
+        "mine": await n([{"assignedTo": user["id"]}]),
+        "unassigned": await n([{"assignedTo": {"$in": [None, ""]}}]),
+        "open": await n([]),
+    }
 
 
 @api.post("/leads")
-async def create_lead(data: LeadIn, user=Depends(current_user)):
+async def create_lead(data: LeadIn, force: bool = False, user=Depends(current_user)):
+    if not force:
+        dup = await find_duplicate(data.phone, data.email)
+        if dup:
+            raise HTTPException(409, detail={"code": "duplicate", "message": f"This {dup['type']} already exists: {dup['name']} ({dup.get('phone') or ''})", "existing": dup})
     doc = {**data.model_dump(), "id": uid(), "createdAt": now_iso(), "updatedAt": now_iso(), "activities": []}
+    if doc.get("assignedTo") and not doc.get("assignedName"):
+        u = await db.users.find_one({"id": doc["assignedTo"]}, {"_id": 0, "name": 1})
+        doc["assignedName"] = (u or {}).get("name")
     await db.leads.insert_one(doc)
     await log_activity(user["id"], "leads", "create", doc["id"], {"name": doc["name"]})
     return clean(doc)
@@ -665,11 +743,80 @@ async def delete_lead(lead_id: str, user=Depends(require_delete("crm.leads"))):
     return {"ok": True}
 
 
+LEAD_PATCH_FIELDS = {"name", "phone", "email", "company", "source", "status", "score", "value", "assignedTo", "assignedName", "followUpDate", "notes", "tags", "vertical", "lostReason"}
+
+
+def _valid_day(v: Any) -> Optional[str]:
+    if v in (None, ""):
+        return None
+    if not re.match(r"^\d{4}-\d{2}-\d{2}", str(v)):
+        raise HTTPException(400, "The follow-up date must look like 2026-10-25")
+    return str(v)[:10]
+
+
+@api.patch("/leads/{lead_id}")
+async def patch_lead(lead_id: str, body: Dict[str, Any], user=Depends(require_module("crm.leads"))):
+    """Changes only the fields that are sent (status, owner, next follow-up date, details) and writes each change in the lead's history."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(404, "Not found")
+    upd = safe_fields(body, LEAD_PATCH_FIELDS)
+    notes: List[str] = []
+    if "status" in upd:
+        if upd["status"] not in LEAD_STATUSES:
+            raise HTTPException(400, "Unknown status")
+        if upd["status"] == "LOST" and not str(upd.get("lostReason") or lead.get("lostReason") or "").strip():
+            raise HTTPException(400, "Please write why this lead is lost")
+        if upd["status"] != lead.get("status"):
+            notes.append(f"Status: {lead.get('status')} → {upd['status']}" + (f" ({upd['lostReason']})" if upd["status"] == "LOST" and upd.get("lostReason") else ""))
+    if "followUpDate" in upd:
+        upd["followUpDate"] = _valid_day(upd["followUpDate"])
+        if upd["followUpDate"] != lead.get("followUpDate"):
+            notes.append(f"Next follow-up: {upd['followUpDate'] or 'none'}")
+    if "assignedTo" in upd:
+        if upd["assignedTo"]:
+            u = await db.users.find_one({"id": upd["assignedTo"], "isActive": {"$ne": False}}, {"_id": 0, "name": 1})
+            if not u:
+                raise HTTPException(400, "That person is not an active user")
+            upd["assignedName"] = u["name"]
+        else:
+            upd["assignedTo"], upd["assignedName"] = None, None
+        if upd["assignedTo"] != lead.get("assignedTo"):
+            notes.append(f"Assigned to {upd['assignedName'] or 'nobody'}")
+    if upd.get("phone") or upd.get("email"):
+        dup = await find_duplicate(upd.get("phone"), upd.get("email"), exclude_id=lead_id)
+        if dup:
+            raise HTTPException(409, detail={"code": "duplicate", "message": f"This {dup['type']} already exists: {dup['name']} ({dup.get('phone') or ''})", "existing": dup})
+    entries = [{"id": uid(), "type": "update", "text": t, "by": user.get("name"), "at": now_iso()} for t in notes]
+    upd["updatedAt"] = now_iso()
+    op: Dict[str, Any] = {"$set": upd}
+    if entries:
+        op["$push"] = {"activities": {"$each": entries}}
+    await db.leads.update_one({"id": lead_id}, op)
+    await log_activity(user["id"], "leads", "update", lead_id, {"fields": sorted(k for k in upd if k != "updatedAt")})
+    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+
+
 @api.post("/leads/{lead_id}/activity")
-async def add_lead_activity(lead_id: str, body: Dict[str, Any], user=Depends(current_user)):
-    entry = {"id": uid(), "type": body.get("type", "note"), "text": body.get("text", ""), "by": user.get("name"), "at": now_iso()}
-    await db.leads.update_one({"id": lead_id}, {"$push": {"activities": entry}, "$set": {"updatedAt": now_iso()}})
-    return entry
+async def add_lead_activity(lead_id: str, body: Dict[str, Any], user=Depends(require_module("crm.leads"))):
+    """A note, a call or a WhatsApp chat on a lead. `outcome` says how a call went and `nextFollowUp` sets the next date. The first
+    call or message moves a NEW lead to CONTACTED."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "status": 1})
+    if not lead:
+        raise HTTPException(404, "Not found")
+    kind = body.get("type") if body.get("type") in ("note", "call", "whatsapp", "visit") else "note"
+    text = str(body.get("text") or "").strip()[:2000]
+    outcome = str(body.get("outcome") or "").strip()[:60]
+    if not text and not outcome:
+        raise HTTPException(400, "Write a note or choose the result of the call")
+    entry = {"id": uid(), "type": kind, "text": text, "outcome": outcome or None, "by": user.get("name"), "at": now_iso()}
+    upd: Dict[str, Any] = {"updatedAt": now_iso()}
+    if body.get("nextFollowUp") is not None:
+        upd["followUpDate"] = _valid_day(body.get("nextFollowUp"))
+    if kind in ("call", "whatsapp", "visit") and lead.get("status") == "NEW":
+        upd["status"] = "CONTACTED"
+    await db.leads.update_one({"id": lead_id}, {"$push": {"activities": entry}, "$set": upd})
+    return {"entry": entry, "lead": await db.leads.find_one({"id": lead_id}, {"_id": 0})}
 
 
 @api.post("/leads/{lead_id}/convert")
@@ -2683,6 +2830,11 @@ async def list_notifications(user=Depends(current_user)):
     new_leads = await db.leads.count_documents({"createdAt": ist_day_range(today)})
     if new_leads > 0:
         alerts.append({"id": "new-leads", "title": "New Leads Today", "message": f"{new_leads} new lead(s) added today", "type": "lead", "isRead": False, "createdAt": now_iso(), "url": "/crm/leads"})
+
+    # 6b. My follow-ups: calls due today or late on the leads that are mine
+    due_mine = await db.leads.count_documents({"$and": [{"assignedTo": user["id"]}] + _follow_filters("due", today)})
+    if due_mine > 0:
+        alerts.append({"id": "followups-due", "title": "Follow-ups due", "message": f"{due_mine} of your lead(s) need a call today or are late", "type": "lead", "isRead": False, "createdAt": now_iso(), "url": "/crm/leads?follow=due&assigned=me"})
 
     # 7. Pending deliveries
     pending_d = await db.deliveries.count_documents({"status": "PENDING"})
@@ -5155,7 +5307,7 @@ async def ensure_indexes():
         ("login_attempts", [("expireAt", 1)], {"expireAfterSeconds": 0}), ("rate_limits", [("expireAt", 1)], {"expireAfterSeconds": 0}),
         ("users", [("id", 1)], {"unique": True}), ("users", [("email", 1)], {}),
         ("leads", [("id", 1)], {"unique": True}), ("leads", [("glczone_lead_id", 1)], {"unique": True, **_present("glczone_lead_id")}),
-        ("leads", [("phone", 1)], {}), ("leads", [("status", 1), ("createdAt", -1)], {}),
+        ("leads", [("phone", 1)], {}), ("leads", [("status", 1), ("createdAt", -1)], {}), ("leads", [("assignedTo", 1), ("followUpDate", 1)], {}),
         ("customers", [("id", 1)], {"unique": True}), ("customers", [("phone", 1)], {}),
         ("customers", [("glczone_user_id", 1)], {"unique": True, **_present("glczone_user_id")}),
         ("quotations", [("id", 1)], {"unique": True}), ("quotations", [("quoteNo", 1)], {"unique": True, **_present("quoteNo")}),
