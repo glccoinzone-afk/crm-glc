@@ -855,7 +855,10 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
     # ---------------- inbox: assign, notes, canned replies, unread
     @api.get("/ocm/agents")
     async def ocm_agents(user=Depends(current_user)):
-        users = await db.users.find({}, {"_id": 0, "id": 1, "name": 1, "role": 1}).sort("name", 1).to_list(500)
+        # only real, active people: no disabled accounts, no "Test ..." logins, no sync bot
+        users = await db.users.find(
+            {"isActive": {"$ne": False}, "isBot": {"$ne": True}, "name": {"$not": {"$regex": r"^\s*(test\b|crm sync bot\s*$)", "$options": "i"}}},
+            {"_id": 0, "id": 1, "name": 1, "role": 1}).sort("name", 1).to_list(500)
         return {"items": users}
 
     @api.post("/ocm/conversations/{cid}/assign")
