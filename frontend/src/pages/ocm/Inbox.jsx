@@ -1,13 +1,37 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Send, Search, Bot, UserCheck, StickyNote, Zap, AlertTriangle, Check, CheckCheck, MessageSquare, X } from "lucide-react";
 import { toast } from "sonner";
-import api from "@/lib/glc";
+import api, { downloadFile } from "@/lib/glc";
 import { useAuth } from "@/context/AuthContext";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Btn, Pill, Select, Tabs, TagChip, errMsg, timeAgo, fmtDateTime } from "./wa/ui";
 
 const CHANNELS = { TELEGRAM: "#0088CC", WHATSAPP: "#25D366", INSTAGRAM: "#E1306C", FACEBOOK: "#1877F2", WEBCHAT: "#064E3B" };
 const WINDOW_MS = 24 * 3600 * 1000;
+
+// A customer's photo / voice note / document: loaded with the sign-in header, shown inline.
+function MediaBubble({ msg }) {
+  const [url, setUrl] = useState(null);
+  const [err, setErr] = useState(false);
+  const kind = msg.msgType;
+  useEffect(() => {
+    let dead = false; let obj = null;
+    if (kind === "image" || kind === "audio" || kind === "sticker" || kind === "video") {
+      api.get(`/ocm/messages/${msg.id}/media`, { responseType: "blob" })
+        .then((r) => { if (!dead) { obj = URL.createObjectURL(r.data); setUrl(obj); } })
+        .catch(() => !dead && setErr(true));
+    }
+    return () => { dead = true; if (obj) URL.revokeObjectURL(obj); };
+  }, [msg.id, kind]);
+  if (kind === "document") {
+    return <button type="button" className="underline text-[12.5px]" onClick={() => downloadFile(`/ocm/messages/${msg.id}/media`, "document").catch(() => toast.error("File not available any more"))}>Download document</button>;
+  }
+  if (err) return <div className="text-[11.5px] opacity-70">File no longer available</div>;
+  if (!url) return <div className="text-[11.5px] opacity-70">Loading…</div>;
+  if (kind === "audio") return <audio controls src={url} className="max-w-full" />;
+  if (kind === "video") return <video controls src={url} className="max-w-full rounded-lg" />;
+  return <img src={url} alt="Customer upload" className="max-w-full max-h-64 rounded-lg" />;
+}
 
 function Ticks({ status }) {
   if (status === "FAILED") return <span className="text-rose-300" title="Failed">!</span>;
@@ -158,6 +182,7 @@ export default function Inbox() {
               ) : (
                 <div key={m.id} className={`flex ${m.direction === "OUT" ? "justify-end" : "justify-start"}`}>
                   <div className={`max-w-[68%] rounded-2xl px-3.5 py-2 text-[13.5px] shadow-sm ${m.direction === "OUT" ? "bg-[hsl(var(--primary))] text-white rounded-br-md" : "bg-white text-slate-800 rounded-bl-md"}`}>
+                    {m.mediaId && <MediaBubble msg={m} />}
                     <div className="whitespace-pre-wrap break-words">{m.text}</div>
                     <div className={`text-[10px] mt-1 flex items-center justify-end gap-1 ${m.direction === "OUT" ? "text-white/60" : "text-slate-400"}`}>
                       {m.sentById === "ai" && <Bot size={9} />}{m.sentBy && m.direction === "OUT" && <span>{m.sentBy} ·</span>}

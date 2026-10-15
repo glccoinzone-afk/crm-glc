@@ -12,6 +12,7 @@ import re
 import json
 import uuid
 import asyncio
+import calendar
 import logging
 import bcrypt
 import jwt as pyjwt
@@ -1991,34 +1992,66 @@ async def update_leave(lid: str, body: Dict[str, Any], user=Depends(require_modu
     return d
 
 
+PF_WAGE_CEILING = 15000.0      # employee PF is 12% of basic, on at most this much (statutory ceiling)
+ESI_WAGE_LIMIT = 21000.0       # ESI applies only when monthly gross is at or below this
+ESI_EMPLOYEE_RATE = 0.0075
+
+
+def payroll_figures(basic: float, lop_days: float, days_in_month: int) -> Dict[str, float]:
+    """Monthly pay slip numbers. Loss-of-pay is taken off first; PF and ESI follow the statutory limits.
+    TDS stays a simple estimate (5% of gross above Rs 50,000): the real figure depends on the employee's declarations, so finance must confirm it."""
+    basic = float(basic or 0)
+    lop = round(basic / days_in_month * lop_days, 2) if days_in_month else 0.0
+    gross = round(max(basic - lop, 0), 2)
+    pf = round(0.12 * min(gross, PF_WAGE_CEILING), 2)
+    esi = round(ESI_EMPLOYEE_RATE * gross, 2) if 0 < gross <= ESI_WAGE_LIMIT else 0.0
+    tds = round(gross * 0.05, 2) if gross > 50000 else 0.0
+    return {"basic": basic, "lopDays": lop_days, "lopAmount": lop, "gross": gross, "pf": pf, "esi": esi, "tds": tds,
+            "netSalary": round(gross - pf - esi - tds, 2)}
+
+
+async def lop_days_for(emp_id: str, month: str) -> float:
+    """Days without pay in a month: days marked ABSENT (half a day for HALF_DAY) plus approved leave without pay (LWP)."""
+    year, mon = int(month[:4]), int(month[5:7])
+    last = calendar.monthrange(year, mon)[1]
+    absent, half = set(), set()
+    async for a in db.attendance.find({"employeeId": emp_id, "date": {"$regex": f"^{month}"}}, {"_id": 0, "date": 1, "status": 1}):
+        if a.get("status") == "ABSENT":
+            absent.add(a["date"][:10])
+        elif a.get("status") == "HALF_DAY":
+            half.add(a["date"][:10])
+    async for lv in db.leaves.find({"employeeId": emp_id, "leaveType": "LWP", "status": "APPROVED"}, {"_id": 0}):
+        try:
+            d0, d1 = datetime.fromisoformat(lv["fromDate"][:10]), datetime.fromisoformat(lv["toDate"][:10])
+        except (KeyError, ValueError):
+            continue
+        for i in range((d1 - d0).days + 1):
+            d = d0 + timedelta(days=i)
+            if d.year == year and d.month == mon and d.day <= last:
+                absent.add(d.strftime("%Y-%m-%d"))
+    return float(len(absent)) + 0.5 * len(half - absent)
+
+
 @api.post("/payroll/generate")
 async def generate_payroll(body: Dict[str, Any], user=Depends(require_module("hr.payroll"))):
-    month = body.get("month") or datetime.now().strftime("%Y-%m")
+    month = body.get("month") or ist_now().strftime("%Y-%m")
+    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+        raise HTTPException(400, "month must look like 2026-09")
+    days_in_month = calendar.monthrange(int(month[:4]), int(month[5:7]))[1]
     emps = await db.employees.find({"status": "ACTIVE"}, {"_id": 0}).to_list(500)
     generated = 0
     for e in emps:
-        exist = await db.payroll.find_one({"employeeId": e["id"], "month": month})
-        if exist:
+        if await db.payroll.find_one({"employeeId": e["id"], "month": month}):
             continue
-        basic = e.get("salary", 0)
-        pf = basic * 0.12
-        esi = basic * 0.0175
-        tds = basic * 0.05 if basic > 50000 else 0
-        net = basic - pf - esi - tds
-        await db.payroll.insert_one({
-            "id": uid(),
-            "employeeId": e["id"],
-            "employeeName": e["name"],
-            "month": month,
-            "basic": basic,
-            "pf": round(pf, 2),
-            "esi": round(esi, 2),
-            "tds": round(tds, 2),
-            "netSalary": round(net, 2),
-            "status": "GENERATED",
-            "createdAt": now_iso(),
-        })
-        generated += 1
+        f = payroll_figures(e.get("salary", 0), await lop_days_for(e["id"], month), days_in_month)
+        try:
+            await db.payroll.insert_one({"id": uid(), "employeeId": e["id"], "employeeName": e["name"], "month": month, **f,
+                                         "status": "GENERATED", "createdAt": now_iso()})
+            generated += 1
+        except Exception as ex:
+            if "duplicate" not in str(ex).lower() and "E11000" not in str(ex):
+                raise
+    await log_activity(user["id"], "payroll", "generate", month, {"generated": generated})
     return {"generated": generated, "month": month}
 
 
@@ -3158,7 +3191,8 @@ async def rbac_sync(data: RbacSyncIn):
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
 
 
-_INLINE_OK = {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+_INLINE_OK = {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
+              "audio/ogg", "audio/mpeg", "audio/mp4", "audio/aac", "audio/amr", "video/mp4", "video/3gpp"}
 
 
 def download_response(data: bytes, mime: Optional[str], name: str):
@@ -3273,6 +3307,16 @@ async def ocm_list_convs(channel: Optional[str] = None, status_: Optional[str] =
     if status_:
         filt["status"] = status_
     items = await db.ocm_conversations.find(filt, {"_id": 0}).sort("lastMessageAt", -1).limit(200).to_list(200)
+    cids = list({c["contactId"] for c in items if c.get("contactId")})
+    contacts = {c["id"]: c async for c in db.ocm_contacts.find({"id": {"$in": cids}}, {"_id": 0, "id": 1, "name": 1, "phone": 1})} if cids else {}
+    uids = list({c["assignedTo"] for c in items if c.get("assignedTo") and not c.get("assignedName")})
+    agents = {u["id"]: u.get("name") async for u in db.users.find({"id": {"$in": uids}}, {"_id": 0, "id": 1, "name": 1})} if uids else {}
+    for c in items:
+        ct = contacts.get(c.get("contactId")) or {}
+        c["contactPhone"] = ct.get("phone")
+        c["contactName"] = c.get("contactName") or ct.get("name") or ct.get("phone") or "Unknown"
+        if c.get("assignedTo") and not c.get("assignedName"):
+            c["assignedName"] = agents.get(c["assignedTo"])
     return {"items": items}
 
 
@@ -3286,6 +3330,38 @@ async def ocm_get_conv(cid: str, user=Depends(current_user)):
     if conv.get("contactId"):
         contact = await db.ocm_contacts.find_one({"id": conv["contactId"]}, {"_id": 0})
     return {"conversation": conv, "messages": msgs, "contact": contact}
+
+
+_MEDIA_KINDS = {"image": "Photo", "audio": "Voice note", "video": "Video", "document": "Document", "sticker": "Sticker"}
+
+
+@api.get("/ocm/messages/{mid}/media")
+async def ocm_message_media(mid: str, user=Depends(current_user)):
+    """A photo, voice note or document the customer sent: fetched from Meta with our token and shown to the signed-in agent."""
+    msg = await db.ocm_messages.find_one({"id": mid, "mediaId": {"$exists": True}}, {"_id": 0})
+    if not msg or not msg.get("mediaId"):
+        raise HTTPException(404, "No media on this message")
+    if not WHATSAPP_ACCESS_TOKEN:
+        raise HTTPException(503, "WhatsApp is not configured")
+    auth = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+
+    def fetch():
+        meta = requests.get(f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{msg['mediaId']}", headers=auth, timeout=15)
+        if meta.status_code != 200:
+            return None
+        info = meta.json()
+        url = info.get("url") or ""
+        if not url.startswith("https://"):
+            return None
+        data = requests.get(url, headers=auth, timeout=30)
+        return (data.content, info.get("mime_type")) if data.status_code == 200 else None
+
+    got = await asyncio.to_thread(fetch)
+    if not got:
+        raise HTTPException(404, "This file is no longer available from WhatsApp (they keep it about 30 days)")
+    data, mime = got
+    ext = (mime or "").split("/")[-1].split(";")[0] or "bin"
+    return download_response(data, mime, f"{_MEDIA_KINDS.get(msg.get('msgType'), 'file')}.{ext}")
 
 
 @api.post("/ocm/conversations/{cid}/messages")
@@ -5326,6 +5402,7 @@ async def ensure_indexes():
         ("ocm_conversations", [("contactId", 1)], {}), ("ocm_conversations", [("lastMessageAt", -1)], {}),
         ("ocm_messages", [("conversationId", 1), ("createdAt", 1)], {}),
         ("ocm_messages", [("waMessageId", 1)], {"unique": True, **_present("waMessageId")}),
+        ("payroll", [("employeeId", 1), ("month", 1)], {"unique": True}),
     ]
     made = 0
     for coll, keys, kw in plan:

@@ -207,3 +207,25 @@ def test_credit_note_puts_returned_goods_back_but_never_more_than_taken(api):
     assert qty() == 9 and r.json()["restocked"] == [{"productId": "p-cn", "qty": 1}]
     r = api.post("/api/invoices/inv-cn/credit-note", headers=api.h, json={"items": [{"index": 0, "qty": 1}], "restock": False})
     assert r.status_code == 200 and qty() == 9 and r.json()["restocked"] == []      # damaged goods: not put back
+
+
+def test_payroll_figures_follow_statutory_limits_and_lop():
+    f = server.payroll_figures(30000, 0, 30)
+    assert f["pf"] == 1800 and f["esi"] == 0 and f["netSalary"] == 28200            # PF capped at 15,000 wage; no ESI above 21,000
+    f = server.payroll_figures(18000, 3, 30)                                          # 3 days lost: 1,800 off
+    assert f["lopAmount"] == 1800 and f["gross"] == 16200 and f["esi"] == 121.5 and f["pf"] == 1800
+    assert server.payroll_figures(60000, 0, 31)["tds"] == 3000
+
+
+def test_payroll_generate_takes_absent_and_unpaid_leave_off_once(api):
+    api.run(server.db.employees.insert_one, {"id": "emp-p", "name": "Pay Test", "salary": 30000, "status": "ACTIVE"})
+    for d, st in (("2026-09-02", "ABSENT"), ("2026-09-03", "HALF_DAY"), ("2026-09-04", "PRESENT")):
+        api.run(server.db.attendance.insert_one, {"id": f"a-{d}", "employeeId": "emp-p", "date": d, "status": st})
+    api.run(server.db.leaves.insert_one, {"id": "l-p", "employeeId": "emp-p", "leaveType": "LWP", "status": "APPROVED", "fromDate": "2026-09-02", "toDate": "2026-09-03"})
+    assert api.post("/api/payroll/generate", headers=api.h, json={"month": "2026-13"}).status_code == 400
+    r = api.post("/api/payroll/generate", headers=api.h, json={"month": "2026-09"})
+    assert r.status_code == 200 and r.json()["generated"] >= 1
+    slip = [p for p in api.get("/api/payroll?month=2026-09", headers=api.h).json()["items"] if p["employeeId"] == "emp-p"][0]
+    assert slip["lopDays"] == 2.0                      # 2 Sep (absent + unpaid leave, counted once) and 3 Sep (unpaid leave); the half day is covered by the leave
+    assert slip["lopAmount"] == 2000 and slip["gross"] == 28000
+    assert api.post("/api/payroll/generate", headers=api.h, json={"month": "2026-09"}).json()["generated"] == 0
