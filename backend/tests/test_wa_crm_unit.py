@@ -95,7 +95,7 @@ def test_signature_and_codes():
     raw = b'{"a":1}'
     good = "sha256=" + hmac.new(b"s", raw, hashlib.sha256).hexdigest()
     assert w.verify_meta_signature(raw, good, "s") and not w.verify_meta_signature(raw, "sha256=bad", "s")
-    assert w.verify_meta_signature(raw, "", "")
+    assert not w.verify_meta_signature(raw, "", "")      # no secret configured: refused
     assert len(w.new_short_code()) == 7
 
 

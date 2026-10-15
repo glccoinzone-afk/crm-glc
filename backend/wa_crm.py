@@ -27,7 +27,7 @@ log = logging.getLogger("glc.wa")
 
 GRAPH_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
 GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
-STOP_WORDS = {"stop", "unsubscribe", "optout", "opt out", "cancel"}
+STOP_WORDS = {"stop", "unsubscribe", "optout", "opt out"}   # not "cancel": customers write it about an order
 STATUS_RANK = {"QUEUED": 0, "SENT": 1, "DELIVERED": 2, "READ": 3}
 TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY", "AUTHENTICATION")
 MAX_MEDIA_BYTES = 16 * 1024 * 1024
@@ -281,7 +281,7 @@ def relay_signature(secret: str, statuses: List[Dict[str, Any]]) -> str:
 
 def verify_meta_signature(raw: bytes, header: str, secret: str) -> bool:
     if not secret:
-        return True
+        return False   # no app secret configured: refuse, never accept unsigned requests
     expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header or "")
 
