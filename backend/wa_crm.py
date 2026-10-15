@@ -281,7 +281,7 @@ def relay_signature(secret: str, statuses: List[Dict[str, Any]]) -> str:
 
 def verify_meta_signature(raw: bytes, header: str, secret: str) -> bool:
     if not secret:
-        return True
+        return False   # no app secret configured: refuse, never accept unsigned requests
     expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header or "")
 
