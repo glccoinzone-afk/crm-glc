@@ -185,3 +185,25 @@ def test_notification_read_state_is_per_person(api):
     api.run(server.db.leads.insert_one, {"id": "nl2", "name": "New2", "status": "NEW", "createdAt": server.now_iso()})
     again = api.get("/api/notifications", headers=api.h).json()
     assert any(i["id"] == "new-leads" and not i["isRead"] for i in again["items"])        # a new lead makes it unread again
+
+
+def test_health_is_public_and_reports_db(api):
+    r = api.get("/api/health")
+    assert r.status_code == 200 and r.json() == {"status": "ok", "db": "ok"}
+
+
+def test_credit_note_puts_returned_goods_back_but_never_more_than_taken(api):
+    api.run(server.db.stock_items.insert_one, {"id": "st-cn", "productId": "p-cn", "qty": 8})
+    api.run(server.db.sales_orders.insert_one, {"id": "o-cn", "stockTaken": [{"productId": "p-cn", "qty": 2}]})
+    inv = {"id": "inv-cn", "invoiceNo": "INV-CN", "orderId": "o-cn", "status": "PAID", "total": 236, "subtotal": 200, "paidAmount": 236, "dueAmount": 0,
+           "supplyType": "INTRA", "items": [{"name": "Soap", "qty": 2, "rate": 100, "gstRate": 18, "hsn": "3401", "productId": "p-cn"}]}
+    api.run(server.db.invoices.insert_one, inv)
+
+    def qty():
+        return api.run(server.db.stock_items.find_one, {"id": "st-cn"})["qty"]
+
+    r = api.post("/api/invoices/inv-cn/credit-note", headers=api.h, json={"items": [{"index": 0, "qty": 1}]})
+    assert r.status_code == 200, r.text
+    assert qty() == 9 and r.json()["restocked"] == [{"productId": "p-cn", "qty": 1}]
+    r = api.post("/api/invoices/inv-cn/credit-note", headers=api.h, json={"items": [{"index": 0, "qty": 1}], "restock": False})
+    assert r.status_code == 200 and qty() == 9 and r.json()["restocked"] == []      # damaged goods: not put back

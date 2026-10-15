@@ -5415,6 +5415,7 @@ class CreditNoteIn(BaseModel):
     reason: str = "Sales return"
     items: Optional[List[Dict[str, Any]]] = None      # [{"index": 0, "qty": 1}]; omit for the whole invoice
     includeDelivery: bool = False
+    restock: bool = True          # put returned goods back in stock (untick for damaged goods)
 
 
 @api.post("/invoices/{iid}/credit-note")
@@ -5448,6 +5449,25 @@ async def create_credit_note(iid: str, data: CreditNoteIn, user=Depends(finance_
           "customerGst": inv.get("customerGst"), "customerState": inv.get("customerState"), "placeOfSupply": inv.get("placeOfSupply"),
           "reason": data.reason, "items": items, "lines": t["lines"], "subtotal": t["subtotal"], "cgst": t["cgst"], "sgst": t["sgst"],
           "igst": t["igst"], "roundOff": t["roundOff"], "total": t["total"], "noteDate": now_iso(), "createdBy": user.get("id"), "createdAt": now_iso()}
+    restocked = []
+    if data.restock and inv.get("orderId"):
+        # only goods this order actually took out of stock can go back, and never more than were taken
+        order = await db.sales_orders.find_one({"id": inv["orderId"]}, {"_id": 0, "stockTaken": 1}) or {}
+        taken = {}
+        for r in order.get("stockTaken") or []:
+            taken[r["productId"]] = taken.get(r["productId"], 0) + float(r.get("qty") or 0)
+        already = {r["productId"]: float(r.get("qty") or 0) for r in (inv.get("restocked") or [])}
+        for it in items:
+            pid = it.get("productId")
+            if it.get("isDelivery") or not pid or pid not in taken:
+                continue
+            room = taken[pid] - already.get(pid, 0) - sum(r["qty"] for r in restocked if r["productId"] == pid)
+            q = min(float(it["qty"]), max(room, 0))
+            if q > 0:
+                restocked.append({"productId": pid, "qty": q})
+        if restocked:
+            await put_back_stock(restocked)
+    cn["restocked"] = restocked
     await db.credit_notes.insert_one(cn)
     credited = round((inv.get("creditedAmount") or 0) + t["total"], 2)
     for p in data.items or []:
@@ -5462,7 +5482,8 @@ async def create_credit_note(iid: str, data: CreditNoteIn, user=Depends(finance_
     due = max(round(net_due - paid, 2), 0)
     status_ = "CREDITED" if net_due <= 0.01 else ("PAID" if due <= 0.01 else ("PARTIAL" if paid > 0 else "UNPAID"))
     await db.invoices.update_one({"id": iid}, {"$set": {"creditedAmount": credited, "creditedQty": prior_qty, "dueAmount": due,
-                                                        "refundDue": max(round(paid - net_due, 2), 0), "status": status_, "updatedAt": now_iso()}})
+                                                        "refundDue": max(round(paid - net_due, 2), 0), "status": status_, "updatedAt": now_iso(),
+                                                        "restocked": (inv.get("restocked") or []) + restocked}})
     await post_journal(f"Credit note {note_no} against {inv.get('invoiceNo')}", gf.journal_for_credit_note(cn), "CN", cn["id"], user)
     await log_activity(user["id"], "credit_notes", "create", cn["id"], {"invoiceId": iid})
     return clean(cn)
@@ -5565,6 +5586,16 @@ async def finance_backfill_books(user=Depends(finance_user)):
         if await post_journal(f"Goods received {po.get('poNo')} (backfill)", gf.journal_for_purchase(po), "PO", po["id"], user):
             posted["purchaseOrders"] += 1
     return {"posted": posted}
+
+
+@api.get("/health")
+async def health():
+    """Public liveness check for monitoring: is the API up and is the database answering. No data is returned."""
+    try:
+        await asyncio.wait_for(db.command("ping"), timeout=3)
+        return {"status": "ok", "db": "ok"}
+    except Exception:
+        raise HTTPException(503, "database not reachable")
 
 
 @api.get("/")
