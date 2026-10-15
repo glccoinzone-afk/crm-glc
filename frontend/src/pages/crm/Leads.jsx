@@ -204,7 +204,7 @@ export default function Leads() {
           <button onClick={() => { setView("all"); setQ(""); setStatus(""); setSource(""); }} className="px-3 py-2 rounded-lg bg-white border border-slate-200 text-[13px]">Show all leads</button>
         }/>
       ) : (
-        <DataGrid columns={columns} rows={rows} loading={loading} testId="leads-grid" onRowClick={(r) => setSelId(r.id)} />
+        <DataGrid columns={columns} rows={rows} loading={loading} testId="leads-grid" noExport onRowClick={(r) => setSelId(r.id)} />
       )}
       <Pager page={page} total={total} limit={LIMIT} onPage={setPage} />
 

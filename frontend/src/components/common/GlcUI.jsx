@@ -125,7 +125,68 @@ export function SkeletonRow({ cols = 5 }) {
   );
 }
 
-export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", onRowClick }) {
+const GRID_PAGE = 50;
+
+// Plain text of one cell for the CSV: a column can give `csv: (row) => text`; otherwise the raw value (objects are left out).
+// A value that starts with = + - @ is prefixed with ' so a spreadsheet does not run it as a formula.
+function csvCell(c, r) {
+  let v = c.csv ? c.csv(r) : r[c.key];
+  if (v === null || v === undefined || typeof v === "object") v = "";
+  v = String(v);
+  if (/^[=+\-@]/.test(v) && Number.isNaN(Number(v))) v = "'" + v;
+  return `"${v.replace(/"/g, '""')}"`;
+}
+
+function gridCsv(columns, rows) {
+  const cols = columns.filter((c) => c.header && c.csv !== false && (c.csv || rows.some((r) => r[c.key] !== undefined)));
+  const lines = [cols.map((c) => `"${String(c.header).replace(/"/g, '""')}"`).join(",")];
+  rows.forEach((r) => lines.push(cols.map((c) => csvCell(c, r)).join(",")));
+  return "\ufeff" + lines.join("\r\n");        // the marker lets Excel read Hindi correctly
+}
+
+function sortValue(c, r) {
+  const v = c.sortValue ? c.sortValue(r) : r[c.key];
+  if (v === null || v === undefined || typeof v === "object") return null;
+  return v;
+}
+
+export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", onRowClick, exportName, noExport = false }) {
+  const [sort, setSort] = React.useState({ key: null, dir: 1 });
+  const [page, setPage] = React.useState(1);
+  const list = rows || [];
+
+  const sorted = React.useMemo(() => {
+    const col = columns.find((c) => c.key === sort.key);
+    if (!col) return list;
+    return [...list].sort((a, b) => {
+      const x = sortValue(col, a); const y = sortValue(col, b);
+      if (x === null && y === null) return 0;
+      if (x === null) return 1;                    // empty values always last
+      if (y === null) return -1;
+      const nx = Number(x); const ny = Number(y);
+      const r = (Number.isFinite(nx) && Number.isFinite(ny) && x !== "" && y !== "") ? nx - ny : String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: "base" });
+      return r * sort.dir;
+    });
+  }, [list, columns, sort]);
+
+  const pages = Math.max(1, Math.ceil(sorted.length / GRID_PAGE));
+  const cur = Math.min(page, pages);
+  const shown = sorted.slice((cur - 1) * GRID_PAGE, cur * GRID_PAGE);
+
+  const toggleSort = (c) => {
+    if (c.sort === false) return;
+    setSort((s) => (s.key === c.key ? { key: c.key, dir: -s.dir } : { key: c.key, dir: 1 }));
+    setPage(1);
+  };
+  const download = () => {
+    const blob = new Blob([gridCsv(columns, sorted)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${exportName || testId.replace(/-grid$/, "")}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
   return (
     <div data-testid={testId} className="bg-white rounded-2xl border border-slate-200/70 card-elev overflow-hidden">
       <div className="overflow-x-auto">
@@ -133,18 +194,23 @@ export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", 
           <thead>
             <tr className="bg-slate-50 border-b border-slate-200 sticky top-0 z-[1]">
               {columns.map((c) => (
-                <th key={c.key} className={`px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500 text-left ${c.align === "right" ? "text-right" : ""}`}>
-                  {c.header}
+                <th
+                  key={c.key}
+                  onClick={() => toggleSort(c)}
+                  aria-sort={sort.key === c.key ? (sort.dir === 1 ? "ascending" : "descending") : undefined}
+                  className={`px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500 text-left select-none ${c.sort === false ? "" : "cursor-pointer hover:text-slate-800"} ${c.align === "right" ? "text-right" : ""}`}
+                >
+                  {c.header}{sort.key === c.key ? (sort.dir === 1 ? " ▲" : " ▼") : ""}
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
             {loading && Array.from({ length: 6 }).map((_, i) => <SkeletonRow key={i} cols={columns.length} />)}
-            {!loading && rows.length === 0 && (
+            {!loading && list.length === 0 && (
               <tr><td colSpan={columns.length} className="px-4 py-12 text-center text-slate-500 text-[13px]">{empty || "No records found."}</td></tr>
             )}
-            {!loading && rows.map((r, idx) => (
+            {!loading && shown.map((r, idx) => (
               <tr
                 key={r.id || idx}
                 onClick={() => onRowClick && onRowClick(r)}
@@ -160,6 +226,21 @@ export function DataGrid({ columns, rows, loading, empty, testId = "data-grid", 
           </tbody>
         </table>
       </div>
+      {!loading && list.length > 0 && (!noExport || pages > 1) && (
+        <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-t border-slate-100 text-[12.5px] text-slate-600" data-testid={`${testId}-foot`}>
+          <span>{pages > 1 ? `${(cur - 1) * GRID_PAGE + 1}-${Math.min(cur * GRID_PAGE, sorted.length)} of ${sorted.length}` : `${sorted.length} record${sorted.length === 1 ? "" : "s"}`}</span>
+          <div className="flex items-center gap-2">
+            {pages > 1 && (
+              <>
+                <button type="button" disabled={cur <= 1} onClick={() => setPage(cur - 1)} className="px-3 h-8 rounded-lg border border-slate-200 bg-white disabled:opacity-40">Previous</button>
+                <span>Page {cur} of {pages}</span>
+                <button type="button" disabled={cur >= pages} onClick={() => setPage(cur + 1)} className="px-3 h-8 rounded-lg border border-slate-200 bg-white disabled:opacity-40">Next</button>
+              </>
+            )}
+            {!noExport && <button type="button" onClick={download} className="px-3 h-8 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-medium" data-testid={`${testId}-csv`}>Download CSV</button>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
