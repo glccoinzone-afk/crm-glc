@@ -30,12 +30,17 @@ export default function Invoices() {
   useEffect(load, [status]);
 
   const openPay = (r) => { setPayFor(r); setPay({ amount: r.dueAmount || 0, method: "UPI", reference: "" }); setPayOpen(true); };
+  const [paying, setPaying] = useState(false);
   const savePay = async () => {
+    if (paying) return;
+    if (!(Number(pay.amount) > 0)) { toast.error("Enter a valid amount"); return; }
+    setPaying(true);
     try {
       await api.post("/payments", { invoiceId: payFor.id, amount: Number(pay.amount), method: pay.method, reference: pay.reference });
       toast.success("Payment recorded");
       setPayOpen(false); load();
     } catch (e) { toast.error(e?.response?.data?.detail || "Failed"); }
+    finally { setPaying(false); }
   };
 
   const openCredit = (r) => {

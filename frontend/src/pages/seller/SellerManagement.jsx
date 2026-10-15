@@ -24,16 +24,23 @@ export default function SellerManagement() {
   };
   useEffect(() => { loadAll(); }, []);
 
-  const wAction = async (id, action) => {
-    await api.post(`/withdrawals/${id}/${action}`);
-    toast.success(`${action.replace("-"," ")} done`);
-    loadAll();
+  const [busyId, setBusyId] = useState(null);
+  const run = async (id, url, okMsg, question) => {
+    if (busyId) return;
+    if (!window.confirm(question)) return;
+    setBusyId(id);
+    try {
+      await api.post(url);
+      toast.success(okMsg);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Action failed");
+    } finally {
+      setBusyId(null);
+      loadAll();
+    }
   };
-  const rAction = async (id, action) => {
-    await api.post(`/returns/${id}/${action}`);
-    toast.success(`Return ${action}d`);
-    loadAll();
-  };
+  const wAction = (id, action) => run(id, `/withdrawals/${id}/${action}`, `${action.replace("-"," ")} done`, `Confirm: ${action.replace("-"," ")} this withdrawal? This moves money.`);
+  const rAction = (id, action) => run(id, `/returns/${id}/${action}`, `Return ${action}d`, `Confirm: ${action} this return?`);
 
   const wCols = [
     { key: "sellerName", header: "Seller" },

@@ -17,8 +17,8 @@ api.interceptors.response.use(
     if (err?.response?.status === 401) {
       localStorage.removeItem("glc_token");
       localStorage.removeItem("glc_user");
-      if (!window.location.pathname.startsWith("/login")) {
-        window.location.href = "/login";
+      if (!window.location.pathname.startsWith("/crm/login")) {
+        window.location.href = "/crm/login";
       }
     }
     return Promise.reject(err);
@@ -26,6 +26,22 @@ api.interceptors.response.use(
 );
 
 export default api;
+
+// Download a protected file with the Authorization header (no token in the URL).
+export async function downloadFile(path, fallbackName = "file") {
+  const res = await api.get(path, { responseType: "blob" });
+  const cd = res.headers?.["content-disposition"] || "";
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+  const name = m ? decodeURIComponent(m[1]) : fallbackName;
+  const url = URL.createObjectURL(res.data);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
 
 export const VERTICALS = [
   { key: "ALL", name: "All Verticals", tag: "GLC" },
@@ -40,7 +56,7 @@ export const VERTICALS = [
 ];
 
 export const fmtInr = (n) => {
-  if (n === null || n === undefined || isNaN(n)) return "₹0";
+  if (n === null || n === undefined || n === "" || isNaN(n)) return "₹0";
   return "₹" + Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 });
 };
 

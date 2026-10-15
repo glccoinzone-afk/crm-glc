@@ -42,6 +42,7 @@ import SellerManagement from "@/pages/seller/SellerManagement";
 import { EmptyState } from "@/components/common/GlcUI";
 import { Lock } from "lucide-react";
 import { Toaster } from "sonner";
+import ErrorBoundary from "@/components/common/ErrorBoundary";
 import { Loader2 } from "lucide-react";
 
 function Guard({ children, module }) {
@@ -122,6 +123,7 @@ function AppRoutes() {
 
 export default function App() {
   return (
+    <ErrorBoundary>
     <BrowserRouter basename="/crm">
       <AuthProvider>
         <MobileNavProvider>
@@ -132,5 +134,6 @@ export default function App() {
         </MobileNavProvider>
       </AuthProvider>
     </BrowserRouter>
+    </ErrorBoundary>
   );
 }

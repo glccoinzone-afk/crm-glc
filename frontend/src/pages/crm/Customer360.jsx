@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useParams, Link } from "react-router-dom";
 import { ArrowLeft, Mail, Phone, MapPin, Building2, Receipt, ShoppingCart, LifeBuoy, IndianRupee } from "lucide-react";
-import api, { fmtInr, fmtDate } from "@/lib/glc";
+import api, { fmtInr, fmtDate, downloadFile } from "@/lib/glc";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { PageHeader, StatusBadge, StatCard } from "@/components/common/GlcUI";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -162,7 +162,7 @@ function CustomerDocs({ customerId }) {
                 <div className="text-[13px] font-medium truncate">{d.name}</div>
                 <div className="text-[11px] text-slate-400">{d.uploadedBy} · {new Date(d.createdAt).toLocaleDateString()}</div>
               </div>
-              <a href={`/crm/api/documents/${d.id}/download?auth=${localStorage.getItem("glc_token")}`} target="_blank" rel="noreferrer" className="text-[11px] px-2 py-1 rounded-md border border-slate-200 text-slate-500 hover:bg-slate-100">Download</a>
+              <button type="button" onClick={() => downloadFile(`/documents/${d.id}/download`, d.name).catch(() => toast.error("Download failed"))} className="text-[11px] px-2 py-1 rounded-md border border-slate-200 text-slate-500 hover:bg-slate-100">Download</button>
             </div>
           ))}
         </div>
