@@ -29,9 +29,14 @@ load_dotenv(ROOT_DIR / ".env")
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-JWT_SECRET = os.environ.get("JWT_SECRET", "glc-zone-supersecret-dev-only-change-in-prod")
+_JWT_DEFAULT = "glc-zone-supersecret-dev-only-change-in-prod"
+JWT_SECRET = os.environ.get("JWT_SECRET", _JWT_DEFAULT)
 JWT_ALGO = "HS256"
-JWT_EXPIRES_MIN = 60 * 24 * 7
+JWT_EXPIRES_MIN = int(os.environ.get("JWT_EXPIRES_MIN", 60 * 24))   # a login lasts 24 hours (it used to be 7 days)
+if JWT_SECRET == _JWT_DEFAULT:
+    if os.environ.get("REQUIRE_JWT_SECRET") == "1":
+        raise RuntimeError("JWT_SECRET is not set: refusing to start with the public default key")
+    logging.getLogger("glc-crm").critical("JWT_SECRET is NOT set: the public default key is in use. Set a long random JWT_SECRET in backend/.env.")
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 STORAGE_APP_NAME = os.environ.get("STORAGE_APP_NAME", "glczone")
 STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
@@ -100,28 +105,129 @@ def verify_pw(pw: str, h: str) -> bool:
         return False
 
 
-def make_token(user_id: str, email: str, role: str) -> str:
+def make_token(user_id: str, email: str, role: str, scope: str = "full", minutes: Optional[int] = None) -> str:
+    """scope "full" is a normal login. scope "2fa" is the short-lived step-one token that is only good for entering the OTP code."""
     payload = {
         "sub": user_id,
         "email": email,
         "role": role,
+        "scope": scope,
         "iat": int(datetime.now(timezone.utc).timestamp()),
-        "exp": int((datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
+        "exp": int((datetime.now(timezone.utc) + timedelta(minutes=minutes or JWT_EXPIRES_MIN)).timestamp()),
     }
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def decode_token(token: str, scope: str = "full") -> Dict[str, Any]:
+    """The payload of a valid token of the given scope. A token without a scope claim is an older normal login."""
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if payload.get("scope", "full") != scope:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return payload
 
 
 async def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)) -> Dict[str, Any]:
     if not cred:
         raise HTTPException(status_code=401, detail="Missing token")
-    try:
-        payload = pyjwt.decode(cred.credentials, JWT_SECRET, algorithms=[JWT_ALGO])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0})
+    payload = decode_token(cred.credentials)
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0, "totp_secret": 0, "totp_secret_pending": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if user.get("isActive", True) is False:
+        raise HTTPException(status_code=403, detail="Account disabled")
     return user
+
+
+def _module_allowed(perms: List[str], module: str) -> bool:
+    """Same rule the screens use: "*" is everything, "crm" covers "crm.leads", and "crm.leads" is exactly that page."""
+    if "*" in perms:
+        return True
+    if module == "*":
+        return False
+    return any(module == p or module.startswith(p + ".") for p in perms)
+
+
+async def _perms_for(role: str) -> List[str]:
+    stored = await db.settings.find_one({"key": "role_perms"})
+    perms_map = stored["value"] if stored else ROLE_PERMS
+    return perms_map.get(role, ROLE_PERMS.get(role, ["dashboard"]))
+
+
+def require_module(*modules: str):
+    """A route only for roles that may open one of these screens. "*" means Admin only. Uses the same permission list as the menu."""
+    async def dep(user=Depends(current_user)) -> Dict[str, Any]:
+        perms = await _perms_for(user.get("role", "Admin"))
+        if not any(_module_allowed(perms, m) for m in modules):
+            raise HTTPException(status_code=403, detail="Your role does not have permission for this")
+        return user
+    return dep
+
+
+DELETE_ROLES = ("Super Admin", "Admin", "Manager")
+
+
+def require_delete(module: str, roles: tuple = DELETE_ROLES):
+    """Deleting needs more than being able to open the screen: the screen's permission AND a senior role."""
+    async def dep(user=Depends(current_user)) -> Dict[str, Any]:
+        perms = await _perms_for(user.get("role", "Admin"))
+        if user.get("role") not in roles or not _module_allowed(perms, module):
+            raise HTTPException(status_code=403, detail="Only a manager or admin can delete this")
+        return user
+    return dep
+
+
+_PROTECTED_FIELDS = {"id", "_id", "createdAt", "createdBy", "password", "totp_secret", "totp_secret_pending"}
+
+
+def safe_fields(body: Optional[Dict[str, Any]], allowed: Optional[set] = None) -> Dict[str, Any]:
+    """The fields of a request body that may be written: never the id, owner, password, Mongo operators or dotted paths."""
+    out: Dict[str, Any] = {}
+    for k, v in (body or {}).items():
+        if k in _PROTECTED_FIELDS or str(k).startswith("$") or "." in str(k):
+            continue
+        if allowed is not None and k not in allowed:
+            continue
+        out[k] = v
+    return out
+
+
+# ---- login throttle: 5 wrong tries lock that account (and 30 wrong tries lock that IP) for 15 minutes
+LOGIN_MAX_FAILS = 5
+IP_MAX_FAILS = 30
+LOGIN_LOCK_MIN = 15
+
+
+def client_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    return (request.headers.get("x-forwarded-for", "").split(",")[0].strip()) or (request.client.host if request.client else "")
+
+
+async def throttle_check(*keys: str):
+    now = datetime.now(timezone.utc)
+    for k in keys:
+        d = await db.login_attempts.find_one({"_id": k})
+        until = d.get("lockedUntil") if d else None
+        if until and until > now.replace(tzinfo=None):
+            mins = max(1, int((until - now.replace(tzinfo=None)).total_seconds() // 60) + 1)
+            raise HTTPException(status_code=429, detail=f"Too many wrong attempts. Try again in {mins} minutes.")
+
+
+async def throttle_fail(*pairs):
+    """pairs: (key, limit). Counts a failed attempt and locks the key when it reaches its limit."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for key, limit in pairs:
+        d = await db.login_attempts.find_one_and_update({"_id": key}, {"$inc": {"count": 1}, "$set": {"last": now}}, upsert=True, return_document=ReturnDocument.AFTER)
+        if d and d.get("count", 0) >= limit:
+            await db.login_attempts.update_one({"_id": key}, {"$set": {"count": 0, "lockedUntil": now + timedelta(minutes=LOGIN_LOCK_MIN), "expireAt": now + timedelta(minutes=LOGIN_LOCK_MIN + 5)}})
+
+
+async def throttle_ok(*keys: str):
+    for k in keys:
+        await db.login_attempts.delete_one({"_id": k})
 
 
 FINANCE_ROLES = ("Super Admin", "Admin", "Accounts", "Finance Staff")
@@ -138,6 +244,8 @@ def clean(doc: Optional[dict]) -> Optional[dict]:
         return doc
     doc.pop("_id", None)
     doc.pop("password", None)
+    doc.pop("totp_secret", None)
+    doc.pop("totp_secret_pending", None)
     return doc
 
 
@@ -250,14 +358,18 @@ class UserOut(BaseModel):
 
 
 @api.post("/auth/login")
-async def auth_login(data: LoginIn):
+async def auth_login(data: LoginIn, request: Request):
+    ek, ik = f"login:{data.email.lower()}", f"ip:{client_ip(request)}"
+    await throttle_check(ek, ik)
     u = await db.users.find_one({"email": data.email.lower()})
     if not u or not verify_pw(data.password, u.get("password", "")):
+        await throttle_fail((ek, LOGIN_MAX_FAILS), (ik, IP_MAX_FAILS))
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not u.get("isActive", True):
         raise HTTPException(status_code=403, detail="Account disabled")
+    await throttle_ok(ek)
     if u.get("twofa_enabled") and u.get("totp_secret"):
-        temp_token = make_token(u["id"], u["email"], u.get("role", "Admin"))
+        temp_token = make_token(u["id"], u["email"], u.get("role", "Admin"), scope="2fa", minutes=5)
         return {"requires_2fa": True, "temp_token": temp_token}
     token = make_token(u["id"], u["email"], u.get("role", "Admin"))
     await log_activity(u["id"], "auth", "login")
@@ -275,7 +387,9 @@ class EmployeeLoginIn(BaseModel):
 
 
 @api.post("/auth/employee-login")
-async def auth_employee_login(data: EmployeeLoginIn):
+async def auth_employee_login(data: EmployeeLoginIn, request: Request):
+    ek, ik = f"emp:{data.employee_code.strip().lower()}", f"ip:{client_ip(request)}"
+    await throttle_check(ek, ik)
     try:
         resp = requests.post(
             "https://glczone.in/api/crm/verify-employee",
@@ -290,7 +404,9 @@ async def auth_employee_login(data: EmployeeLoginIn):
 
     body = resp.json() if resp.content else {}
     if resp.status_code != 200 or not body.get("valid"):
+        await throttle_fail((ek, LOGIN_MAX_FAILS), (ik, IP_MAX_FAILS))
         raise HTTPException(401, body.get("message", "Invalid Employee ID or PIN"))
+    await throttle_ok(ek)
 
     role = body["role"]
     name = body.get("name", "Employee")
@@ -319,7 +435,7 @@ async def auth_employee_login(data: EmployeeLoginIn):
         await db.users.insert_one(dict(u))
 
     if u.get("twofa_enabled") and u.get("totp_secret"):
-        temp_token = make_token(u["id"], u["email"], role)
+        temp_token = make_token(u["id"], u["email"], role, scope="2fa", minutes=5)
         return {"requires_2fa": True, "temp_token": temp_token}
     token = make_token(u["id"], u["email"], role)
     await log_activity(u["id"], "auth", "employee_login")
@@ -407,7 +523,7 @@ async def update_user_name(user_id: str, data: UserNameUpdateIn, user=Depends(cu
 # ---------- Generic helpers for CRUD collections ----------
 async def paginate(collection, filt: dict, page: int = 1, limit: int = 50, sort_field: str = "createdAt", sort_dir: int = -1, search_fields: Optional[List[str]] = None, q: Optional[str] = None):
     if q and search_fields:
-        filt = {**filt, "$or": [{f: {"$regex": q, "$options": "i"}} for f in search_fields]}
+        filt = {**filt, "$or": [{f: {"$regex": re.escape(q), "$options": "i"}} for f in search_fields]}
     total = await collection.count_documents(filt)
     cursor = collection.find(filt, {"_id": 0}).sort(sort_field, sort_dir).skip((page - 1) * limit).limit(limit)
     items = await cursor.to_list(length=limit)
@@ -460,7 +576,7 @@ async def get_lead(lead_id: str, user=Depends(current_user)):
 
 
 @api.put("/leads/{lead_id}")
-async def update_lead(lead_id: str, data: LeadIn, user=Depends(current_user)):
+async def update_lead(lead_id: str, data: LeadIn, user=Depends(require_module("crm.leads"))):
     upd = {**data.model_dump(), "updatedAt": now_iso()}
     r = await db.leads.update_one({"id": lead_id}, {"$set": upd})
     if not r.matched_count:
@@ -471,7 +587,7 @@ async def update_lead(lead_id: str, data: LeadIn, user=Depends(current_user)):
 
 
 @api.delete("/leads/{lead_id}")
-async def delete_lead(lead_id: str, user=Depends(current_user)):
+async def delete_lead(lead_id: str, user=Depends(require_delete("crm.leads"))):
     await db.leads.delete_one({"id": lead_id})
     await log_activity(user["id"], "leads", "delete", lead_id)
     return {"ok": True}
@@ -485,7 +601,7 @@ async def add_lead_activity(lead_id: str, body: Dict[str, Any], user=Depends(cur
 
 
 @api.post("/leads/{lead_id}/convert")
-async def convert_lead(lead_id: str, user=Depends(current_user)):
+async def convert_lead(lead_id: str, user=Depends(require_module("crm.leads"))):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(404, "Not found")
@@ -557,7 +673,7 @@ async def get_customer(cid: str, user=Depends(current_user)):
 
 
 @api.put("/customers/{cid}")
-async def update_customer(cid: str, data: CustomerIn, user=Depends(current_user)):
+async def update_customer(cid: str, data: CustomerIn, user=Depends(require_module("crm.customers"))):
     r = await db.customers.update_one({"id": cid}, {"$set": {**data.model_dump(), "updatedAt": now_iso()}})
     if not r.matched_count:
         raise HTTPException(404, "Not found")
@@ -566,7 +682,7 @@ async def update_customer(cid: str, data: CustomerIn, user=Depends(current_user)
 
 
 @api.delete("/customers/{cid}")
-async def delete_customer(cid: str, user=Depends(current_user)):
+async def delete_customer(cid: str, user=Depends(require_delete("crm.customers"))):
     await db.customers.delete_one({"id": cid})
     return {"ok": True}
 
@@ -601,7 +717,8 @@ async def create_deal(data: DealIn, user=Depends(current_user)):
 
 
 @api.put("/deals/{did}")
-async def update_deal(did: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_deal(did: str, body: Dict[str, Any], user=Depends(require_module("crm.pipeline"))):
+    body = safe_fields(body)
     body["updatedAt"] = now_iso()
     await db.deals.update_one({"id": did}, {"$set": body})
     d = await db.deals.find_one({"id": did}, {"_id": 0})
@@ -609,7 +726,7 @@ async def update_deal(did: str, body: Dict[str, Any], user=Depends(current_user)
 
 
 @api.delete("/deals/{did}")
-async def delete_deal(did: str, user=Depends(current_user)):
+async def delete_deal(did: str, user=Depends(require_delete("crm.pipeline"))):
     await db.deals.delete_one({"id": did})
     return {"ok": True}
 
@@ -678,7 +795,7 @@ async def get_quote(qid: str, user=Depends(current_user)):
 
 
 @api.put("/quotations/{qid}")
-async def update_quote(qid: str, data: QuoteIn, user=Depends(current_user)):
+async def update_quote(qid: str, data: QuoteIn, user=Depends(require_module("crm.quotations"))):
     items = [i.model_dump() for i in data.items]
     intra = gf.is_intra_state(data.customerGst, data.customerState)
     totals = calc_gst(items, intra_state=intra)
@@ -688,7 +805,7 @@ async def update_quote(qid: str, data: QuoteIn, user=Depends(current_user)):
 
 
 @api.delete("/quotations/{qid}")
-async def delete_quote(qid: str, user=Depends(current_user)):
+async def delete_quote(qid: str, user=Depends(require_delete("crm.quotations"))):
     await db.quotations.delete_one({"id": qid})
     return {"ok": True}
 
@@ -699,11 +816,8 @@ async def quote_pdf(qid: str, cred: HTTPAuthorizationCredentials = Depends(beare
     raw_token = cred.credentials if cred else None
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing token")
-    try:
-        payload = pyjwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGO])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0})
+    payload = decode_token(raw_token)
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0, "totp_secret": 0, "totp_secret_pending": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     q = await db.quotations.find_one({"id": qid}, {"_id": 0})
@@ -966,7 +1080,7 @@ async def email_quote(qid: str, user=Depends(current_user)):
 
 
 @api.post("/quotations/{qid}/convert")
-async def convert_quote_to_order(qid: str, user=Depends(current_user)):
+async def convert_quote_to_order(qid: str, user=Depends(require_module("crm.quotations"))):
     q = await db.quotations.find_one({"id": qid}, {"_id": 0})
     if not q:
         raise HTTPException(404, "Not found")
@@ -1051,7 +1165,8 @@ async def get_order(oid: str, user=Depends(current_user)):
 
 
 @api.put("/orders/{oid}")
-async def update_order(oid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_order(oid: str, body: Dict[str, Any], user=Depends(require_module("sales.orders"))):
+    body = safe_fields(body)
     body["updatedAt"] = now_iso()
     await db.sales_orders.update_one({"id": oid}, {"$set": body})
     d = await db.sales_orders.find_one({"id": oid}, {"_id": 0})
@@ -1059,7 +1174,7 @@ async def update_order(oid: str, body: Dict[str, Any], user=Depends(current_user
 
 
 @api.delete("/orders/{oid}")
-async def delete_order(oid: str, user=Depends(current_user)):
+async def delete_order(oid: str, user=Depends(require_delete("sales.orders"))):
     await db.sales_orders.delete_one({"id": oid})
     return {"ok": True}
 
@@ -1078,7 +1193,7 @@ async def current_user_optional(request: Request):
 async def current_user_or_secret(request: Request):
     """GLC_BRIDGE_AUTH: JWT login ya X-CRM-Secret header dono accept karta hai."""
     secret = os.environ.get("CRM_BRIDGE_SECRET", "")
-    if secret and request.headers.get("X-CRM-Secret") == secret:
+    if secret and hmac.compare_digest(request.headers.get("X-CRM-Secret", "").encode(), secret.encode()):
         return {"id": "system", "role": "system"}
     user = await current_user_optional(request)
     if user:
@@ -1265,14 +1380,14 @@ async def create_product(data: ProductIn, user=Depends(current_user)):
 
 
 @api.put("/products/{pid}")
-async def update_product(pid: str, data: ProductIn, user=Depends(current_user)):
+async def update_product(pid: str, data: ProductIn, user=Depends(require_module("inventory.products"))):
     await db.products.update_one({"id": pid}, {"$set": {**data.model_dump(), "updatedAt": now_iso()}})
     d = await db.products.find_one({"id": pid}, {"_id": 0})
     return d
 
 
 @api.delete("/products/{pid}")
-async def delete_product(pid: str, user=Depends(current_user)):
+async def delete_product(pid: str, user=Depends(require_delete("inventory.products"))):
     await db.products.delete_one({"id": pid})
     return {"ok": True}
 
@@ -1375,14 +1490,14 @@ async def create_supplier(data: SupplierIn, user=Depends(current_user)):
 
 
 @api.put("/suppliers/{sid}")
-async def update_supplier(sid: str, data: SupplierIn, user=Depends(current_user)):
+async def update_supplier(sid: str, data: SupplierIn, user=Depends(require_module("purchase.suppliers"))):
     await db.suppliers.update_one({"id": sid}, {"$set": {**data.model_dump(), "updatedAt": now_iso()}})
     d = await db.suppliers.find_one({"id": sid}, {"_id": 0})
     return d
 
 
 @api.delete("/suppliers/{sid}")
-async def delete_supplier(sid: str, user=Depends(current_user)):
+async def delete_supplier(sid: str, user=Depends(require_delete("purchase.suppliers"))):
     await db.suppliers.delete_one({"id": sid})
     return {"ok": True}
 
@@ -1416,7 +1531,8 @@ async def create_po(data: POIn, user=Depends(current_user)):
 
 
 @api.put("/purchase-orders/{pid}")
-async def update_po(pid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_po(pid: str, body: Dict[str, Any], user=Depends(require_module("purchase.orders"))):
+    body = safe_fields(body)
     body["updatedAt"] = now_iso()
     # If marking RECEIVED, increment stock
     prev_po = await db.purchase_orders.find_one({"id": pid}, {"_id": 0}) or {}
@@ -1442,7 +1558,7 @@ async def update_po(pid: str, body: Dict[str, Any], user=Depends(current_user)):
 
 
 @api.delete("/purchase-orders/{pid}")
-async def delete_po(pid: str, user=Depends(current_user)):
+async def delete_po(pid: str, user=Depends(require_delete("purchase.orders"))):
     await db.purchase_orders.delete_one({"id": pid})
     return {"ok": True}
 
@@ -1480,7 +1596,8 @@ async def create_delivery(data: DeliveryIn, user=Depends(current_user)):
 
 
 @api.put("/deliveries/{did}")
-async def update_delivery(did: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_delivery(did: str, body: Dict[str, Any], user=Depends(require_module("delivery"))):
+    body = safe_fields(body)
     body["updatedAt"] = now_iso()
     await db.deliveries.update_one({"id": did}, {"$set": body})
     d = await db.deliveries.find_one({"id": did}, {"_id": 0})
@@ -1508,12 +1625,12 @@ class EmployeeIn(BaseModel):
 
 
 @api.get("/employees")
-async def list_employees(page: int = 1, limit: int = 100, q: Optional[str] = None, user=Depends(current_user)):
+async def list_employees(page: int = 1, limit: int = 100, q: Optional[str] = None, user=Depends(require_module("hr.employees", "hr.attendance", "hr.leaves", "hr.payroll"))):
     return await paginate(db.employees, {}, page, limit, search_fields=["name", "email", "department", "designation", "employeeId"], q=q)
 
 
 @api.post("/employees")
-async def create_employee(data: EmployeeIn, user=Depends(current_user)):
+async def create_employee(data: EmployeeIn, user=Depends(require_module("hr.employees"))):
     count = await db.employees.count_documents({})
     doc = {**data.model_dump(), "id": uid(), "employeeId": data.employeeId or f"GLC{1000+count+1}", "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.employees.insert_one(doc)
@@ -1521,14 +1638,14 @@ async def create_employee(data: EmployeeIn, user=Depends(current_user)):
 
 
 @api.put("/employees/{eid}")
-async def update_employee(eid: str, data: EmployeeIn, user=Depends(current_user)):
+async def update_employee(eid: str, data: EmployeeIn, user=Depends(require_module("hr.employees"))):
     await db.employees.update_one({"id": eid}, {"$set": {**data.model_dump(), "updatedAt": now_iso()}})
     d = await db.employees.find_one({"id": eid}, {"_id": 0})
     return d
 
 
 @api.delete("/employees/{eid}")
-async def delete_employee(eid: str, user=Depends(current_user)):
+async def delete_employee(eid: str, user=Depends(require_delete("hr.employees", ("Super Admin", "Admin", "HR")))):
     await db.employees.delete_one({"id": eid})
     return {"ok": True}
 
@@ -1591,14 +1708,15 @@ async def apply_leave(data: LeaveIn, user=Depends(current_user)):
 
 
 @api.put("/leaves/{lid}")
-async def update_leave(lid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_leave(lid: str, body: Dict[str, Any], user=Depends(require_module("hr.leaves"))):
+    body = safe_fields(body)
     await db.leaves.update_one({"id": lid}, {"$set": body})
     d = await db.leaves.find_one({"id": lid}, {"_id": 0})
     return d
 
 
 @api.post("/payroll/generate")
-async def generate_payroll(body: Dict[str, Any], user=Depends(current_user)):
+async def generate_payroll(body: Dict[str, Any], user=Depends(require_module("hr.payroll"))):
     month = body.get("month") or datetime.now().strftime("%Y-%m")
     emps = await db.employees.find({"status": "ACTIVE"}, {"_id": 0}).to_list(500)
     generated = 0
@@ -1629,7 +1747,7 @@ async def generate_payroll(body: Dict[str, Any], user=Depends(current_user)):
 
 
 @api.get("/payroll")
-async def list_payroll(month: Optional[str] = None, user=Depends(current_user)):
+async def list_payroll(month: Optional[str] = None, user=Depends(require_module("hr.payroll"))):
     filt = {}
     if month:
         filt["month"] = month
@@ -1745,20 +1863,21 @@ class ExpenseIn(BaseModel):
 
 
 @api.get("/expenses")
-async def list_expenses(user=Depends(current_user)):
+async def list_expenses(user=Depends(require_module("finance.expenses"))):
     items = await db.expenses.find({}, {"_id": 0}).sort("createdAt", -1).to_list(500)
     return {"items": items}
 
 
 @api.post("/expenses")
-async def create_expense(data: ExpenseIn, user=Depends(current_user)):
+async def create_expense(data: ExpenseIn, user=Depends(require_module("finance.expenses"))):
     doc = {**data.model_dump(), "id": uid(), "createdAt": now_iso()}
     await db.expenses.insert_one(doc)
     return clean(doc)
 
 
 @api.put("/expenses/{eid}")
-async def update_expense(eid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_expense(eid: str, body: Dict[str, Any], user=Depends(require_module("finance.expenses"))):
+    body = safe_fields(body)
     await db.expenses.update_one({"id": eid}, {"$set": body})
     d = await db.expenses.find_one({"id": eid}, {"_id": 0})
     return d
@@ -1792,7 +1911,8 @@ async def create_project(data: ProjectIn, user=Depends(current_user)):
 
 
 @api.put("/projects/{pid}")
-async def update_project(pid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_project(pid: str, body: Dict[str, Any], user=Depends(require_module("projects"))):
+    body = safe_fields(body)
     await db.projects.update_one({"id": pid}, {"$set": body})
     d = await db.projects.find_one({"id": pid}, {"_id": 0})
     return d
@@ -1828,14 +1948,15 @@ async def create_task(data: TaskIn, user=Depends(current_user)):
 
 
 @api.put("/tasks/{tid}")
-async def update_task(tid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_task(tid: str, body: Dict[str, Any], user=Depends(require_module("tasks"))):
+    body = safe_fields(body)
     await db.tasks.update_one({"id": tid}, {"$set": body})
     d = await db.tasks.find_one({"id": tid}, {"_id": 0})
     return d
 
 
 @api.delete("/tasks/{tid}")
-async def delete_task(tid: str, user=Depends(current_user)):
+async def delete_task(tid: str, user=Depends(require_module("tasks"))):
     await db.tasks.delete_one({"id": tid})
     return {"ok": True}
 
@@ -1894,7 +2015,8 @@ async def push_ticket_status_to_glczone(glczone_ticket_id: str, crm_status: str)
 
 
 @api.put("/tickets/{tid}")
-async def update_ticket(tid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def update_ticket(tid: str, body: Dict[str, Any], user=Depends(require_module("tickets"))):
+    body = safe_fields(body)
     body["updatedAt"] = now_iso()
     await db.tickets.update_one({"id": tid}, {"$set": body})
     d = await db.tickets.find_one({"id": tid}, {"_id": 0})
@@ -1916,7 +2038,7 @@ async def order_event_webhook(request: Request):
     import os
     secret = request.headers.get("X-Crm-Bridge-Secret", "")
     expected = os.getenv("CRM_BRIDGE_SECRET", "")
-    if not expected or secret != expected:
+    if not expected or not hmac.compare_digest(secret.encode(), expected.encode()):
         raise HTTPException(401, "Unauthorized")
 
     body = await request.json()
@@ -2229,7 +2351,7 @@ async def call_glczone_bridge(path: str, data: dict):
 
 
 @api.get("/withdrawals")
-async def list_withdrawals(page: int = 1, limit: int = 50, status_: Optional[str] = Query(None, alias="status"), user=Depends(current_user)):
+async def list_withdrawals(page: int = 1, limit: int = 50, status_: Optional[str] = Query(None, alias="status"), user=Depends(require_module("*"))):
     q = {}
     if status_:
         q["status"] = status_
@@ -2240,7 +2362,7 @@ async def list_withdrawals(page: int = 1, limit: int = 50, status_: Optional[str
 
 
 @api.post("/withdrawals/{wid}/approve")
-async def approve_withdrawal(wid: str, user=Depends(current_user)):
+async def approve_withdrawal(wid: str, user=Depends(require_module("*"))):
     w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
     if not w:
         raise HTTPException(404, "Withdrawal not found")
@@ -2254,7 +2376,7 @@ async def approve_withdrawal(wid: str, user=Depends(current_user)):
 
 
 @api.post("/withdrawals/{wid}/reject")
-async def reject_withdrawal(wid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def reject_withdrawal(wid: str, body: Dict[str, Any], user=Depends(require_module("*"))):
     w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
     if not w:
         raise HTTPException(404, "Withdrawal not found")
@@ -2269,7 +2391,7 @@ async def reject_withdrawal(wid: str, body: Dict[str, Any], user=Depends(current
 
 
 @api.post("/withdrawals/{wid}/mark-paid")
-async def mark_withdrawal_paid(wid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def mark_withdrawal_paid(wid: str, body: Dict[str, Any], user=Depends(require_module("*"))):
     w = await db.withdrawals.find_one({"id": wid}, {"_id": 0})
     if not w:
         raise HTTPException(404, "Withdrawal not found")
@@ -2286,7 +2408,7 @@ async def mark_withdrawal_paid(wid: str, body: Dict[str, Any], user=Depends(curr
 # ===================== RETURN REQUESTS (Two-way sync with glczone.in) =====================
 
 @api.get("/returns")
-async def list_returns(page: int = 1, limit: int = 50, status_: Optional[str] = Query(None, alias="status"), user=Depends(current_user)):
+async def list_returns(page: int = 1, limit: int = 50, status_: Optional[str] = Query(None, alias="status"), user=Depends(require_module("*"))):
     q = {}
     if status_:
         q["status"] = status_
@@ -2297,7 +2419,7 @@ async def list_returns(page: int = 1, limit: int = 50, status_: Optional[str] = 
 
 
 @api.post("/returns/{rid}/approve")
-async def approve_return(rid: str, user=Depends(current_user)):
+async def approve_return(rid: str, user=Depends(require_module("*"))):
     r = await db.returns.find_one({"id": rid}, {"_id": 0})
     if not r:
         raise HTTPException(404, "Return request not found")
@@ -2316,7 +2438,7 @@ async def approve_return(rid: str, user=Depends(current_user)):
 
 
 @api.post("/returns/{rid}/reject")
-async def reject_return(rid: str, body: Dict[str, Any], user=Depends(current_user)):
+async def reject_return(rid: str, body: Dict[str, Any], user=Depends(require_module("*"))):
     r = await db.returns.find_one({"id": rid}, {"_id": 0})
     if not r:
         raise HTTPException(404, "Return request not found")
@@ -2372,7 +2494,7 @@ async def create_document(data: DocumentIn, user=Depends(current_user)):
 
 
 @api.delete("/documents/{did}")
-async def delete_document(did: str, user=Depends(current_user)):
+async def delete_document(did: str, user=Depends(require_module("documents"))):
     await db.documents.delete_one({"id": did})
     return {"ok": True}
 
@@ -2535,8 +2657,8 @@ async def audit_export(q: Optional[str] = None, user_id: Optional[str] = None, m
 # SETTINGS / USERS
 # =========================================================
 @api.get("/users")
-async def list_users(user=Depends(current_user)):
-    items = await db.users.find({}, {"_id": 0, "password": 0}).to_list(500)
+async def list_users(user=Depends(require_module("settings"))):
+    items = await db.users.find({}, {"_id": 0, "password": 0, "totp_secret": 0, "totp_secret_pending": 0}).to_list(500)
     return {"items": items}
 
 
@@ -2547,7 +2669,8 @@ async def get_company(user=Depends(current_user)):
 
 
 @api.put("/settings/company")
-async def update_company(body: Dict[str, Any], user=Depends(current_user)):
+async def update_company(body: Dict[str, Any], user=Depends(require_module("settings"))):
+    body = safe_fields(body)
     await db.settings.update_one({"key": "company"}, {"$set": {"value": body}}, upsert=True)
     return body
 
@@ -2737,6 +2860,23 @@ async def rbac_sync(data: RbacSyncIn):
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
 
 
+_INLINE_OK = {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+
+
+def download_response(data: bytes, mime: Optional[str], name: str):
+    """Files are shown in the browser only when they are plain images or PDFs; everything else (html, svg, scripts) is a download.
+    nosniff and a sandbox policy stop an uploaded page from running inside the CRM."""
+    mime = (mime or "application/octet-stream").split(";")[0].strip().lower()
+    inline = mime in _INLINE_OK
+    safe = re.sub(r'[^A-Za-z0-9._ -]', "_", os.path.basename(name or "file"))[:120] or "file"
+    return Response(
+        content=data,
+        media_type=mime if inline else "application/octet-stream",
+        headers={"Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{safe}"',
+                 "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"},
+    )
+
+
 @api.post("/documents/upload")
 async def upload_document(file: UploadFile = File(...), category: str = "GENERAL", user=Depends(current_user)):
     data = await file.read()
@@ -2773,23 +2913,16 @@ async def download_document(doc_id: str, auth: Optional[str] = None, cred: HTTPA
         token = auth
     if not token:
         raise HTTPException(401, "Missing token")
-    try:
-        pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
-    except Exception:
-        raise HTTPException(401, "Invalid token")
+    decode_token(token)
     rec = await db.documents.find_one({"id": doc_id, "isDeleted": {"$ne": True}}, {"_id": 0})
     if not rec or not rec.get("storage_path"):
         raise HTTPException(404, "Not found")
     data, ctype = get_object(rec["storage_path"])
-    return Response(
-        content=data,
-        media_type=rec.get("mime") or ctype or "application/octet-stream",
-        headers={"Content-Disposition": f'inline; filename="{rec.get("name", "file")}"'},
-    )
+    return download_response(data, rec.get("mime") or ctype, rec.get("name", "file"))
 
 
 @api.delete("/documents/{doc_id}")
-async def delete_document_v2(doc_id: str, user=Depends(current_user)):
+async def delete_document_v2(doc_id: str, user=Depends(require_module("documents"))):
     await db.documents.update_one({"id": doc_id}, {"$set": {"isDeleted": True, "deletedAt": now_iso()}})
     await log_activity(user["id"], "documents", "delete", doc_id)
     return {"ok": True}
@@ -2919,7 +3052,7 @@ async def ocm_create_broadcast(data: BroadcastIn, user=Depends(current_user)):
 
 
 @api.post("/ocm/broadcasts/{bid}/send")
-async def ocm_send_broadcast(bid: str, user=Depends(current_user)):
+async def ocm_send_broadcast(bid: str, user=Depends(require_module("ocm.broadcasts"))):
     """Sends the broadcast message on each selected channel to all subscribed contacts that have that channel's contact id."""
     # claim the broadcast atomically so a double click / retry can't send it twice
     b = await db.ocm_broadcasts.find_one_and_update(
@@ -3144,11 +3277,16 @@ async def lookup_order_status(order_id_str: str, phone: str) -> str:
             db="glczone_db", autocommit=True
         )
         async with conn.cursor() as cur:
+            # only the customer's own order: the order's mobile must match the WhatsApp number that is asking
+            last10 = re.sub(r"\D", "", phone or "")[-10:]
+            if len(last10) < 10:
+                conn.close()
+                return "nahi mila is number par."
             await cur.execute(
                 "SELECT o.id, o.total, o.payment_method, o.created_at, oi.status "
                 "FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id "
-                "WHERE o.id = %s LIMIT 1",
-                (order_id,)
+                "WHERE o.id = %s AND o.mobile LIKE %s LIMIT 1",
+                (order_id, "%" + last10)
             )
             row = await cur.fetchone()
         conn.close()
@@ -3731,7 +3869,7 @@ async def global_search(q: str = "", user=Depends(current_user)):
     if not q or len(q) < 2:
         return {"results": []}
     
-    pattern = {"$regex": q, "$options": "i"}
+    pattern = {"$regex": re.escape(q), "$options": "i"}
     results = []
 
     # Leads
@@ -3834,32 +3972,34 @@ async def disable_2fa(body: Dict[str, Any], user=Depends(current_user)):
     return {"ok": True, "message": "2FA disabled"}
 
 @api.post("/auth/2fa/verify")
-async def verify_2fa(body: Dict[str, Any]):
-    """Verify OTP during login (no auth required)."""
+async def verify_2fa(body: Dict[str, Any], request: Request):
+    """Verify OTP during login. Only the short-lived step-one token (scope "2fa") is accepted here."""
     token = body.get("temp_token", "")
     code = str(body.get("code", ""))
     if not token or not code:
         raise HTTPException(400, "Missing fields")
-    
-    # Decode temp token to get user
-    try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        uid_ = payload.get("sub")
-    except Exception:
-        raise HTTPException(401, "Invalid token")
-    
+
+    payload = decode_token(token, scope="2fa")
+    uid_ = payload.get("sub")
+    tk, ik = f"2fa:{uid_}", f"ip:{client_ip(request)}"
+    await throttle_check(tk, ik)
+
     u = await db.users.find_one({"id": uid_}, {"_id": 0})
     if not u:
         raise HTTPException(404, "User not found")
-    
+    if not u.get("isActive", True):
+        raise HTTPException(403, "Account disabled")
+
     secret = u.get("totp_secret")
     if not secret:
         raise HTTPException(400, "2FA not configured")
-    
+
     totp = pyotp.TOTP(secret)
     if not totp.verify(code, valid_window=1):
+        await throttle_fail((tk, LOGIN_MAX_FAILS), (ik, IP_MAX_FAILS))
         raise HTTPException(400, "Invalid OTP")
-    
+    await throttle_ok(tk)
+
     # Issue full token
     full_token = make_token(u["id"], u.get("email",""), u.get("role",""))
     return {"token": full_token, "user": {k: u[k] for k in ["id","name","email","role","employeeCode"] if k in u}}
@@ -3900,10 +4040,13 @@ async def upload_file(file: UploadFile = File(...), user=Depends(current_user)):
 
 @api.get("/files/{filename}")
 async def get_file(filename: str, user=Depends(current_user)):
-    filepath = os.path.join(UPLOAD_DIR, filename)
-    if not os.path.exists(filepath):
+    name = os.path.basename(filename)
+    filepath = os.path.realpath(os.path.join(UPLOAD_DIR, name))
+    if name != filename or not filepath.startswith(os.path.realpath(UPLOAD_DIR) + os.sep) or not os.path.isfile(filepath):
         raise HTTPException(404, "File not found")
-    return FileResponse(filepath)
+    ext = os.path.splitext(name)[1].lower()
+    inline = ext in (".png", ".jpg", ".jpeg", ".gif", ".pdf")
+    return FileResponse(filepath, headers={"Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{name}"', "X-Content-Type-Options": "nosniff"})
 
 
 # ── GLC Zone Sync Endpoints ──────────────────────────────────────
@@ -5002,10 +5145,11 @@ wa_crm.register(app, api, db, current_user, uid, now_iso, clean, log_activity)
 channels_hub.register(api, db, current_user, send_platform_message, log_activity)
 app.include_router(api)
 
+_CORS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=_CORS != ["*"],   # logins use a Bearer header, not cookies: no credentials are needed with the open default
+    allow_origins=_CORS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

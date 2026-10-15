@@ -27,7 +27,7 @@ log = logging.getLogger("glc.wa")
 
 GRAPH_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
 GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
-STOP_WORDS = {"stop", "unsubscribe", "optout", "opt out", "cancel"}
+STOP_WORDS = {"stop", "unsubscribe", "optout", "opt out"}   # not "cancel": customers write it about an order
 STATUS_RANK = {"QUEUED": 0, "SENT": 1, "DELIVERED": 2, "READ": 3}
 TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY", "AUTHENTICATION")
 MAX_MEDIA_BYTES = 16 * 1024 * 1024
