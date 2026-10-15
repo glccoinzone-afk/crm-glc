@@ -254,3 +254,35 @@ def test_webchat_needs_a_session_and_is_rate_limited(api, fakes):
             break
     assert ok == 20 and r.status_code == 429                                                # the 21st message is refused
     assert api.post("/api/ocm/webchat", json={"sessionId": "visitor-other-99", "text": "hello"}).status_code == 200   # another visitor is fine
+
+
+def test_inbox_list_has_contact_names_and_media_comes_from_meta(api, monkeypatch):
+    api.run(server.db.ocm_contacts.insert_one, {"id": "c-nm", "name": "Ravi Kumar", "phone": "919800000001"})
+    api.run(server.db.ocm_contacts.insert_one, {"id": "c-np", "phone": "919800000002"})
+    api.run(server.db.ocm_conversations.insert_one, {"id": "cv-nm", "contactId": "c-nm", "channel": "WHATSAPP", "status": "OPEN", "lastMessageAt": "2026-10-15T10:00:00+00:00"})
+    api.run(server.db.ocm_conversations.insert_one, {"id": "cv-np", "contactId": "c-np", "channel": "WHATSAPP", "status": "OPEN", "lastMessageAt": "2026-10-15T09:00:00+00:00"})
+    items = {c["id"]: c for c in api.get("/api/ocm/conversations", headers=api.h).json()["items"]}
+    assert items["cv-nm"]["contactName"] == "Ravi Kumar"
+    assert items["cv-np"]["contactName"] == "919800000002"            # no name yet: show the number, not "Unknown"
+
+    api.run(server.db.ocm_messages.insert_one, {"id": "m-img", "conversationId": "cv-nm", "direction": "IN", "msgType": "image", "mediaId": "MID1", "text": "[📷 Photo received]"})
+
+    class R:
+        def __init__(self, code, js=None, content=b""):
+            self.status_code, self._js, self.content = code, js, content
+
+        def json(self):
+            return self._js
+
+    def fake_get(url, headers=None, timeout=0):
+        assert headers["Authorization"].startswith("Bearer ")
+        if url.endswith("/MID1"):
+            return R(200, {"url": "https://lookaside.example/x", "mime_type": "image/jpeg"})
+        return R(200, content=b"\xff\xd8jpegbytes")
+
+    monkeypatch.setattr(server, "WHATSAPP_ACCESS_TOKEN", "tok")
+    monkeypatch.setattr(server.requests, "get", fake_get)
+    r = api.get("/api/ocm/messages/m-img/media", headers=api.h)
+    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg" and r.content.startswith(b"\xff\xd8")
+    assert api.get("/api/ocm/messages/nope/media", headers=api.h).status_code == 404
+    assert api.get("/api/ocm/messages/m-img/media").status_code in (401, 403)

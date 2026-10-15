@@ -62,7 +62,7 @@ function PayslipView({ slip }) {
   const ref = useRef(null);
   const print = useReactToPrint({ contentRef: ref, documentTitle: `Payslip-${slip.employeeName}-${slip.month}` });
   const total = slip.basic;
-  const gross = slip.basic;
+  const gross = slip.gross ?? slip.basic;
   return (
     <div>
       <div className="flex items-center justify-between px-5 pt-4 pb-3 border-b border-slate-100">
@@ -88,15 +88,16 @@ function PayslipView({ slip }) {
           <div>
             <div className="text-[10.5px] uppercase tracking-wide font-semibold text-slate-500 mb-2">Earnings</div>
             <Row k="Basic Salary" v={fmtInr(slip.basic)} />
+            {slip.lopAmount > 0 && <Row k={`Loss of pay (${slip.lopDays} day${slip.lopDays === 1 ? "" : "s"})`} v={"− " + fmtInr(slip.lopAmount)} />}
             <div className="border-t border-slate-100 mt-2 pt-2 flex justify-between font-semibold text-[13px]">
               <span>Gross</span><span className="font-mono tabular">{fmtInr(gross)}</span>
             </div>
           </div>
           <div>
             <div className="text-[10.5px] uppercase tracking-wide font-semibold text-slate-500 mb-2">Deductions</div>
-            <Row k="Provident Fund (12%)" v={fmtInr(slip.pf)} />
-            <Row k="ESI (1.75%)" v={fmtInr(slip.esi)} />
-            <Row k="TDS" v={fmtInr(slip.tds)} />
+            <Row k="Provident Fund (12%, up to ₹15,000)" v={fmtInr(slip.pf)} />
+            <Row k="ESI (0.75%, gross up to ₹21,000)" v={fmtInr(slip.esi)} />
+            <Row k="TDS (estimate)" v={fmtInr(slip.tds)} />
             <div className="border-t border-slate-100 mt-2 pt-2 flex justify-between font-semibold text-[13px]">
               <span>Total Deductions</span><span className="font-mono tabular">{fmtInr(slip.pf + slip.esi + slip.tds)}</span>
             </div>
