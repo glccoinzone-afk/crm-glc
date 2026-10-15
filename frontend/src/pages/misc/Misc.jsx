@@ -365,7 +365,7 @@ export function AuditLog() {
           <button onClick={() => load(page)} className="px-3 h-9 rounded-lg bg-white border border-rose-200 text-[13px] font-medium">Retry</button>
         </div>
       ) : (
-        <DataGrid columns={columns} rows={rows} loading={loading} testId="audit-grid" empty="No entries for this filter." onRowClick={setSel} />
+        <DataGrid columns={columns} rows={rows} loading={loading} testId="audit-grid" noExport empty="No entries for this filter." onRowClick={setSel} />
       )}
 
       <div className="flex items-center justify-between text-[13px] text-slate-600">
