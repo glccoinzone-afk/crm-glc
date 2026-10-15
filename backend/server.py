@@ -145,7 +145,14 @@ def cleans(docs: List[dict]) -> List[dict]:
     return [clean(d) for d in docs]
 
 
+import contextvars
+_audit_ctx: "contextvars.ContextVar" = contextvars.ContextVar("audit_ctx", default=None)
+
+
 async def log_activity(user_id: str, module: str, action: str, entity_id: Optional[str] = None, meta: Optional[dict] = None):
+    ctx = _audit_ctx.get()
+    if ctx is not None:
+        ctx["logged"] = True   # this request already wrote its own, richer audit row: the automatic one is skipped
     await db.audit_logs.insert_one({
         "id": uid(),
         "userId": user_id,
@@ -153,8 +160,77 @@ async def log_activity(user_id: str, module: str, action: str, entity_id: Option
         "action": action,
         "entityId": entity_id,
         "meta": meta or {},
+        "source": "app",
         "createdAt": now_iso(),
     })
+
+
+# ---- automatic audit trail: every change made through the API is written down (who, what, which item, did it work, from where) ----
+_AUDIT_SKIP = ("/api/ocm/message/incoming", "/api/ocm/wa/status-relay", "/api/webhooks/whatsapp", "/api/ocm/webchat", "/api/notifications", "/api/auth/2fa/setup")
+_AUDIT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-|^[0-9a-f]{16,}$|^\d{6,}$", re.I)
+_AUDIT_USER_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def audit_describe(method: str, path: str) -> Dict[str, Optional[str]]:
+    """module / item id / action of an API call, read from its path: POST /api/leads/<id>/convert -> leads, <id>, convert."""
+    parts = [p for p in path.split("/") if p][1:]   # drop "api"
+    module = parts[0] if parts else "api"
+    if module == "ocm" and len(parts) > 1 and not _AUDIT_ID_RE.match(parts[1]):
+        module = "ocm." + parts[1]
+    entity = next((p for p in parts[1:] if _AUDIT_ID_RE.match(p)), None)
+    tail = parts[-1] if len(parts) > 1 and not _AUDIT_ID_RE.match(parts[-1]) else None
+    default = {"POST": "create", "PUT": "update", "PATCH": "update", "DELETE": "delete"}.get(method, method.lower())
+    action = tail if tail and tail != module.split(".")[-1] else default
+    return {"module": module, "entityId": entity, "action": action}
+
+
+async def _audit_write(method: str, path: str, status_code: int, user_id: Optional[str], ip: str, ms: int):
+    try:
+        d = audit_describe(method, path)
+        actor = _AUDIT_USER_CACHE.get(user_id or "")
+        if user_id and not actor:
+            u = await db.users.find_one({"id": user_id}, {"_id": 0, "name": 1, "role": 1})
+            if u:
+                actor = {"name": u.get("name", ""), "role": u.get("role", "")}
+                _AUDIT_USER_CACHE[user_id] = actor
+        if path in ("/api/auth/login", "/api/auth/employee-login", "/api/auth/2fa/verify") and status_code >= 400:
+            d["action"] = "login_failed" if "login" in path else "2fa_failed"
+        await db.audit_logs.insert_one({
+            "id": uid(), "userId": user_id or "system", "userName": (actor or {}).get("name") or ("System / website" if not user_id else ""),
+            "userRole": (actor or {}).get("role", ""), "module": d["module"], "action": d["action"], "entityId": d["entityId"],
+            "meta": {}, "source": "api", "method": method, "path": path, "status": status_code, "ip": ip, "ms": ms, "createdAt": now_iso(),
+        })
+    except Exception as e:   # the audit trail must never break a request
+        log.warning(f"audit write failed: {e}")
+
+
+@app.middleware("http")
+async def audit_trail(request: Request, call_next):
+    if request.method in ("GET", "HEAD", "OPTIONS") or not request.url.path.startswith("/api/") or request.url.path.startswith(_AUDIT_SKIP) or request.url.path.endswith("/read"):
+        return await call_next(request)
+    ctx = {"logged": False}
+    token = _audit_ctx.set(ctx)
+    started = datetime.now(timezone.utc)
+    try:
+        response = await call_next(request)
+    finally:
+        _audit_ctx.reset(token)
+    try:
+        user_id = None
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            try:
+                user_id = pyjwt.decode(auth[7:], JWT_SECRET, algorithms=[JWT_ALGO]).get("sub")
+            except Exception:
+                user_id = None
+        failed_login = request.url.path in ("/api/auth/login", "/api/auth/employee-login", "/api/auth/2fa/verify") and response.status_code >= 400
+        if not ctx["logged"] or failed_login:
+            ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()) or (request.client.host if request.client else "")
+            ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            asyncio.create_task(_audit_write(request.method, request.url.path, response.status_code, user_id, ip, ms))
+    except Exception as e:
+        log.warning(f"audit middleware failed: {e}")
+    return response
 
 
 # ---------- Auth ----------
@@ -2378,9 +2454,81 @@ async def mark_all_read(user=Depends(current_user)):
     return {"ok": True}
 
 
+AUDIT_ROLES = ("Super Admin", "Admin")
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+async def audit_user(user=Depends(current_user)) -> Dict[str, Any]:
+    if user.get("role") not in AUDIT_ROLES:
+        raise HTTPException(status_code=403, detail="The audit log is for Admin only")
+    return user
+
+
+def _audit_filter(q, user_id, module, result, date_from, date_to) -> dict:
+    parts: List[dict] = []
+    if user_id:
+        parts.append({"userId": user_id})
+    if module:
+        parts.append({"module": module})
+    if result == "error":
+        parts.append({"status": {"$gte": 400}})
+    elif result == "ok":
+        parts.append({"$or": [{"status": {"$lt": 400}}, {"status": {"$exists": False}}]})
+    if q:
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        parts.append({"$or": [{"module": rx}, {"action": rx}, {"entityId": rx}, {"path": rx}, {"userName": rx}]})
+    for val, op, tail in ((date_from, "$gte", "T00:00:00"), (date_to, "$lte", "T23:59:59.999999")):
+        if val and re.match(r"^\d{4}-\d{2}-\d{2}$", val):   # dates are Indian dates; rows are stored in UTC
+            parts.append({"createdAt": {op: datetime.fromisoformat(val + tail).replace(tzinfo=_IST).astimezone(timezone.utc).isoformat()}})
+    return {"$and": parts} if parts else {}
+
+
+async def _audit_attach_names(items: List[dict]):
+    ids = {r.get("userId") for r in items if r.get("userId") and r["userId"] != "system" and not r.get("userName")}
+    names = {}
+    if ids:
+        async for u in db.users.find({"id": {"$in": list(ids)}}, {"_id": 0, "id": 1, "name": 1, "role": 1}):
+            names[u["id"]] = u
+    for r in items:
+        if not r.get("userName"):
+            u = names.get(r.get("userId"))
+            r["userName"] = u["name"] if u else ("System / website" if r.get("userId") == "system" else "")
+            r["userRole"] = u.get("role", "") if u else r.get("userRole", "")
+
+
 @api.get("/audit")
-async def audit(page: int = 1, limit: int = 100, user=Depends(current_user)):
-    return await paginate(db.audit_logs, {}, page, limit, sort_field="createdAt", sort_dir=-1)
+async def audit(page: int = 1, limit: int = 50, q: Optional[str] = None, user_id: Optional[str] = None, module: Optional[str] = None,
+                result: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, user=Depends(audit_user)):
+    limit = max(1, min(limit, 200))
+    res = await paginate(db.audit_logs, _audit_filter(q, user_id, module, result, date_from, date_to), max(1, page), limit, sort_field="createdAt", sort_dir=-1)
+    await _audit_attach_names(res["items"])
+    return res
+
+
+@api.get("/audit/meta")
+async def audit_meta(user=Depends(audit_user)):
+    modules = sorted(m for m in await db.audit_logs.distinct("module") if m)
+    users = await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1).to_list(500)
+    return {"modules": modules, "users": users}
+
+
+@api.get("/audit/export")
+async def audit_export(q: Optional[str] = None, user_id: Optional[str] = None, module: Optional[str] = None, result: Optional[str] = None,
+                       date_from: Optional[str] = None, date_to: Optional[str] = None, user=Depends(audit_user)):
+    import csv
+    rows = await db.audit_logs.find(_audit_filter(q, user_id, module, result, date_from, date_to), {"_id": 0}).sort("createdAt", -1).to_list(5000)
+    await _audit_attach_names(rows)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Time (IST)", "User", "Role", "Module", "Action", "Item", "Result", "Method", "Path", "IP"])
+    for r in rows:
+        try:
+            t = datetime.fromisoformat(r["createdAt"]).astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            t = r.get("createdAt", "")
+        w.writerow([t, r.get("userName", ""), r.get("userRole", ""), r.get("module", ""), r.get("action", ""), r.get("entityId") or "",
+                    r.get("status", "ok"), r.get("method", ""), r.get("path", ""), r.get("ip", "")])
+    return Response(content="\ufeff" + buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="audit-log.csv"'})
 
 
 # =========================================================
@@ -4627,6 +4775,12 @@ async def startup_seed():
         await ensure_finance_accounts()
     except Exception as e:
         log.warning(f"Finance accounts check failed: {e}")
+    try:
+        await db.audit_logs.create_index([("createdAt", -1)])
+        await db.audit_logs.create_index([("userId", 1), ("createdAt", -1)])
+        await db.audit_logs.create_index([("module", 1), ("createdAt", -1)])
+    except Exception as e:
+        log.warning(f"Audit index creation failed: {e}")
     asyncio.create_task(scheduled_posts_worker())
     log.info("Scheduled posts worker started")
 

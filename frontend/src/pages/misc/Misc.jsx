@@ -275,20 +275,123 @@ export function Documents() {
 }
 
 // ---------- Audit Log ----------
+const AUDIT_ACTIONS = { create: "Created", update: "Updated", delete: "Deleted", convert: "Converted", approve: "Approved", reject: "Rejected", cancel: "Cancelled", send: "Sent", upload: "Uploaded", publish: "Published", generate: "Generated", login: "Logged in", sso_login: "Logged in (website)", employee_login: "Logged in (employee)", login_failed: "Failed login", "2fa_failed": "Failed 2FA code", messages: "Sent a message", assign: "Assigned", "mark-paid": "Marked paid" };
+const auditWhen = (iso) => {
+  try { return new Date(iso).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }); } catch { return iso || "—"; }
+};
+const auditAction = (a) => AUDIT_ACTIONS[a] || (a || "—").replace(/[-_]/g, " ").replace(/^./, (c) => c.toUpperCase());
+
 export function AuditLog() {
   const [rows, setRows] = useState([]);
-  useEffect(() => { api.get("/audit").then((r) => setRows(r.data.items || [])); }, []);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [meta, setMeta] = useState({ modules: [], users: [] });
+  const [f, setF] = useState({ q: "", user_id: "", module: "", result: "", date_from: "", date_to: "" });
+  const [sel, setSel] = useState(null);
+  const limit = 50;
+  const params = (extra = {}) => Object.fromEntries(Object.entries({ ...f, ...extra }).filter(([, v]) => v !== "" && v != null));
+
+  const load = (p = page) => {
+    setLoading(true); setError("");
+    api.get("/audit", { params: params({ page: p, limit }) })
+      .then((r) => { setRows(r.data.items || []); setTotal(r.data.total || 0); })
+      .catch((e) => setError(e?.response?.data?.detail || "Could not load the audit log. Please try again."))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { api.get("/audit/meta").then((r) => setMeta(r.data)).catch(() => {}); }, []);
+  useEffect(() => { load(page); /* eslint-disable-next-line */ }, [page, f.user_id, f.module, f.result, f.date_from, f.date_to]);
+
+  const search = (e) => { e.preventDefault(); setPage(1); load(1); };
+  const exportCsv = async () => {
+    try {
+      const r = await api.get("/audit/export", { params: params(), responseType: "blob" });
+      const url = URL.createObjectURL(r.data);
+      const a = document.createElement("a"); a.href = url; a.download = "audit-log.csv"; a.click(); URL.revokeObjectURL(url);
+    } catch { toast.error("Export failed"); }
+  };
+  const pages = Math.max(1, Math.ceil(total / limit));
+
   const columns = [
-    { key: "createdAt", header: "Time", render: (r) => fmtDate(r.createdAt) },
-    { key: "userId", header: "User", mono: true, render: (r) => (r.userId || "").slice(0, 8) },
-    { key: "module", header: "Module" },
-    { key: "action", header: "Action" },
-    { key: "entityId", header: "Entity", mono: true, render: (r) => (r.entityId || "—").slice(0, 8) },
+    { key: "createdAt", header: "When (IST)", render: (r) => <span className="whitespace-nowrap">{auditWhen(r.createdAt)}</span> },
+    { key: "userName", header: "Who", render: (r) => (<div><div className="font-medium">{r.userName || "—"}</div><div className="text-[11px] text-slate-500">{r.userRole || ""}</div></div>) },
+    { key: "action", header: "What", render: (r) => <span className="font-medium">{auditAction(r.action)}</span> },
+    { key: "module", header: "Where", render: (r) => <span className="text-slate-600">{(r.module || "").replace(/\./g, " / ")}</span> },
+    { key: "entityId", header: "Item", mono: true, render: (r) => (r.entityId ? r.entityId.slice(0, 8) : "—") },
+    { key: "status", header: "Result", render: (r) => (r.status >= 400
+      ? <span className="inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium bg-rose-50 text-rose-700">Failed {r.status}</span>
+      : <span className="inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700">OK</span>) },
+    { key: "ip", header: "From", mono: true, render: (r) => r.ip || "—" },
   ];
+  const input = "h-10 px-3 rounded-lg border border-slate-200 text-[13px] bg-white outline-none focus:border-[hsl(var(--primary))]";
+
   return (
     <div className="space-y-6">
-      <PageHeader testId="audit-page" title="Audit Log" subtitle="System-wide activity trail for accountability" />
-      <DataGrid columns={columns} rows={rows} testId="audit-grid" empty="No audit entries." />
+      <PageHeader testId="audit-page" title="Audit Log" subtitle="Who did what, when and from where. Every change made in the CRM is written here." />
+      <form onSubmit={search} className="bg-white rounded-2xl border border-slate-200/70 card-elev p-4 flex flex-wrap items-end gap-3">
+        <label className="text-[11.5px] font-medium text-slate-600">Search
+          <input value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} placeholder="action, module, item, person" className={`${input} mt-1 block w-56`} />
+        </label>
+        <label className="text-[11.5px] font-medium text-slate-600">Person
+          <select value={f.user_id} onChange={(e) => { setPage(1); setF({ ...f, user_id: e.target.value }); }} className={`${input} mt-1 block`}>
+            <option value="">Everyone</option>
+            {meta.users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </label>
+        <label className="text-[11.5px] font-medium text-slate-600">Area
+          <select value={f.module} onChange={(e) => { setPage(1); setF({ ...f, module: e.target.value }); }} className={`${input} mt-1 block`}>
+            <option value="">All areas</option>
+            {meta.modules.map((m) => <option key={m} value={m}>{m.replace(/\./g, " / ")}</option>)}
+          </select>
+        </label>
+        <label className="text-[11.5px] font-medium text-slate-600">Result
+          <select value={f.result} onChange={(e) => { setPage(1); setF({ ...f, result: e.target.value }); }} className={`${input} mt-1 block`}>
+            <option value="">All</option><option value="ok">OK</option><option value="error">Failed</option>
+          </select>
+        </label>
+        <label className="text-[11.5px] font-medium text-slate-600">From
+          <input type="date" value={f.date_from} onChange={(e) => { setPage(1); setF({ ...f, date_from: e.target.value }); }} className={`${input} mt-1 block`} />
+        </label>
+        <label className="text-[11.5px] font-medium text-slate-600">To
+          <input type="date" value={f.date_to} onChange={(e) => { setPage(1); setF({ ...f, date_to: e.target.value }); }} className={`${input} mt-1 block`} />
+        </label>
+        <button type="submit" className="h-10 px-4 rounded-lg bg-[hsl(var(--primary))] text-white text-[13px] font-medium">Search</button>
+        <button type="button" onClick={exportCsv} className="h-10 px-4 rounded-lg border border-slate-200 text-[13px] font-medium text-slate-700 hover:bg-slate-50">Download CSV</button>
+      </form>
+
+      {error ? (
+        <div className="bg-rose-50 border border-rose-200 text-rose-800 rounded-2xl p-5 text-[13px] flex items-center justify-between">
+          <span>{error}</span>
+          <button onClick={() => load(page)} className="px-3 h-9 rounded-lg bg-white border border-rose-200 text-[13px] font-medium">Retry</button>
+        </div>
+      ) : (
+        <DataGrid columns={columns} rows={rows} loading={loading} testId="audit-grid" empty="No entries for this filter." onRowClick={setSel} />
+      )}
+
+      <div className="flex items-center justify-between text-[13px] text-slate-600">
+        <span>{total} entries</span>
+        <div className="flex items-center gap-2">
+          <button disabled={page <= 1} onClick={() => setPage(page - 1)} className="px-3 h-9 rounded-lg border border-slate-200 disabled:opacity-40">Previous</button>
+          <span>Page {page} of {pages}</span>
+          <button disabled={page >= pages} onClick={() => setPage(page + 1)} className="px-3 h-9 rounded-lg border border-slate-200 disabled:opacity-40">Next</button>
+        </div>
+      </div>
+
+      <Dialog open={!!sel} onOpenChange={(o) => !o && setSel(null)}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>{sel ? `${auditAction(sel.action)}: ${(sel.module || "").replace(/\./g, " / ")}` : ""}</DialogTitle></DialogHeader>
+          {sel && (
+            <dl className="grid grid-cols-3 gap-y-2 text-[13px]">
+              {[["When (IST)", auditWhen(sel.createdAt)], ["Who", `${sel.userName || "—"} ${sel.userRole ? "(" + sel.userRole + ")" : ""}`], ["Item id", sel.entityId || "—"],
+                ["Result", sel.status ? (sel.status >= 400 ? `Failed (${sel.status})` : `OK (${sel.status})`) : "OK"], ["Request", sel.method ? `${sel.method} ${sel.path}` : "—"],
+                ["From IP", sel.ip || "—"], ["Took", sel.ms != null ? `${sel.ms} ms` : "—"], ["Details", Object.keys(sel.meta || {}).length ? JSON.stringify(sel.meta) : "—"]].map(([k, v]) => (
+                <React.Fragment key={k}><dt className="text-slate-500">{k}</dt><dd className="col-span-2 break-all font-medium text-slate-800">{v}</dd></React.Fragment>
+              ))}
+            </dl>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
