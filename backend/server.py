@@ -3516,6 +3516,52 @@ async def ocm_create_broadcast(data: BroadcastIn, user=Depends(current_user)):
     return clean(doc)
 
 
+def send_whatsapp_template_text(to_phone: str, template_name: str, language: str, text: str) -> dict:
+    """Send an approved template whose body has ONE variable {{1}}; the broadcast message goes in it."""
+    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        return {"success": False, "error": "WhatsApp credentials not configured"}
+    clean = re.sub(r"[\r\n\t]+", " | ", text or "")      # Meta rejects newlines / tabs in template variables
+    clean = re.sub(r" {4,}", "   ", clean).strip()[:1000] or "-"
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp", "to": to_phone, "type": "template",
+        "template": {"name": template_name, "language": {"code": language or "en"},
+                     "components": [{"type": "body", "parameters": [{"type": "text", "text": clean}]}]},
+    }
+    try:
+        r = requests.post(url, json=payload, headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}, timeout=15)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        return {"success": r.status_code == 200, "response": data}
+    except Exception as e:
+        log.exception(f"WhatsApp template send failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def wa_broadcast_send(bid: str, to_phone: str, text: str, tpl: dict) -> dict:
+    """One WhatsApp broadcast message. Saves Meta's message id so delivery receipts reach the broadcast."""
+    name = (tpl or {}).get("templateName")
+    if name:
+        result = await asyncio.to_thread(send_whatsapp_template_text, to_phone, name, (tpl or {}).get("language") or "en", text)
+    else:
+        result = await asyncio.to_thread(send_whatsapp_text, to_phone, text)
+    resp = result.get("response")
+    wid = ((resp.get("messages") or [{}])[0]).get("id") if isinstance(resp, dict) else None
+    ok = bool(result.get("success"))
+    err = ""
+    if not ok:
+        e = resp.get("error") if isinstance(resp, dict) else None
+        err = str(result.get("error") or (f"({e.get('code')}) {e.get('message')}" if isinstance(e, dict) else "failed"))[:200]
+    try:
+        await db.ocm_wa_messages.insert_one({"id": uid(), "broadcastId": bid, "to": to_phone, "waMessageId": wid,
+                                             "status": "SENT" if ok else "FAILED", "error": err, "createdAt": now_iso(), "text": (text or "")[:500]})
+    except Exception as e:
+        log.warning(f"broadcast message not recorded: {e}")
+    return result
+
+
 @api.post("/ocm/broadcasts/{bid}/send")
 async def ocm_send_broadcast(bid: str, user=Depends(require_module("ocm.broadcasts"))):
     """Sends the broadcast message on each selected channel to all subscribed contacts that have that channel's contact id."""
@@ -3533,6 +3579,7 @@ async def ocm_send_broadcast(bid: str, user=Depends(require_module("ocm.broadcas
     channels = b.get("channels") or ["TELEGRAM"]
     message = b.get("message") or ""
     audience = b.get("audience") or "ALL"
+    wa_tpl = await db.ocm_settings.find_one({"key": "broadcast"}, {"_id": 0}) or {}
 
     sent_count = 0
     failed_count = 0
@@ -3573,7 +3620,7 @@ async def ocm_send_broadcast(bid: str, user=Depends(require_module("ocm.broadcas
             seen_recipients.add(dedupe_key)
             try:
                 if channel == "WHATSAPP":
-                    result = await asyncio.to_thread(send_whatsapp_text, recipient, message)
+                    result = await wa_broadcast_send(bid, recipient, message, wa_tpl)
                 elif channel == "TELEGRAM":
                     result = await asyncio.to_thread(send_telegram_text, recipient, message)
                 elif channel in ("INSTAGRAM", "FACEBOOK"):
@@ -3613,7 +3660,7 @@ async def ocm_send_broadcast(bid: str, user=Depends(require_module("ocm.broadcas
                     continue
                 seen_recipients.add(dedupe_key)
                 try:
-                    result = await asyncio.to_thread(send_whatsapp_text, recipient, message)
+                    result = await wa_broadcast_send(bid, recipient, message, wa_tpl)
                 except Exception as e:
                     result = {"success": False, "error": str(e)}
 

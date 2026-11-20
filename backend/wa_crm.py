@@ -805,6 +805,32 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
             return PlainTextResponse(q.get("hub.challenge", ""))
         raise HTTPException(403, "Verification failed")
 
+    async def refresh_broadcast_counts(bid: str) -> None:
+        """Delivered / read / failed of a broadcast, recomputed from Meta's receipts."""
+        try:
+            b = await db.ocm_broadcasts.find_one({"id": bid}, {"_id": 0}) or {}
+            if b.get("status") == "SENDING":
+                return                      # the final totals are written when sending ends; receipts after that refresh them
+            rows = await db.ocm_wa_messages.find({"broadcastId": bid}, {"_id": 0, "status": 1, "error": 1, "waMessageId": 1}).to_list(50000)
+            delivered = sum(1 for r in rows if r.get("status") in ("DELIVERED", "READ"))
+            read = sum(1 for r in rows if r.get("status") == "READ")
+            late = [r for r in rows if r.get("status") == "FAILED" and r.get("waMessageId")]   # accepted by Meta, then not delivered
+            base = b.get("syncFailureReasons")
+            if base is None:
+                base = b.get("failureReasons") or []
+            why: Dict[str, int] = {}
+            for r in late:
+                k = (r.get("error") or "Not delivered")[:120]
+                why[k] = why.get(k, 0) + 1
+            merged = list(base) + [{"reason": "Not delivered: " + k, "count": v} for k, v in sorted(why.items(), key=lambda kv: -kv[1])[:5]]
+            await db.ocm_broadcasts.update_one({"id": bid}, {"$set": {
+                "deliveredCount": delivered, "readCount": read, "lateFailed": len(late),
+                "failedCount": int(b.get("failedCount") or 0) + len(late) - int(b.get("lateFailed") or 0),
+                "syncFailureReasons": base, "failureReasons": merged}})
+        except Exception as e:
+            import logging
+            logging.getLogger("wa_crm").warning("broadcast counts not refreshed: %s", e)
+
     async def apply_statuses(statuses: List[Dict[str, Any]]) -> int:
         """Record delivery receipts on campaign messages (or inbox replies). Returns how many were applied."""
         applied = 0
@@ -819,6 +845,8 @@ def register(app, api, db, current_user, uid, now_iso, clean, log_activity):
                     upd["error"] = st.get("error") or "Failed"
                 await db.ocm_wa_messages.update_one({"id": doc["id"]}, {"$set": upd})
                 applied += 1
+                if doc.get("broadcastId"):
+                    await refresh_broadcast_counts(doc["broadcastId"])
             else:  # reply sent from the inbox
                 await db.ocm_messages.update_one({"waMessageId": st["waMessageId"]}, {"$set": {"status": st["status"]}})
         if statuses:
