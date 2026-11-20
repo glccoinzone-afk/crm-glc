@@ -4,6 +4,8 @@ import api, { fmtInr, fmtDate } from "@/lib/glc";
 import { PageHeader, DataGrid, StatusBadge, EmptyState } from "@/components/common/GlcUI";
 import { toast } from "sonner";
 
+const up = (v) => String(v || "").toUpperCase();
+
 export default function SellerManagement() {
   const [tab, setTab] = useState("withdrawals");
   const [withdrawals, setWithdrawals] = useState([]);
@@ -43,19 +45,19 @@ export default function SellerManagement() {
   const rAction = (id, action) => run(id, `/returns/${id}/${action}`, `Return ${action}d`, `Confirm: ${action} this return?`);
 
   const wCols = [
-    { key: "sellerName", header: "Seller" },
-    { key: "amount", header: "Amount", mono: true, align: "right", render: (r) => fmtInr(r.amount || 0) },
+    { key: "sellerName", header: "Member", render: (r) => (<div><div>{r.sellerName}</div><div className="text-[11px] text-slate-500">{r.mobile || ""}</div></div>) },
+    { key: "amount", header: "Amount", mono: true, align: "right", render: (r) => (<div>{fmtInr(r.amount || 0)}{r.tds ? <div className="text-[11px] text-slate-500">pay {fmtInr(r.netAmount || 0)} after TDS {fmtInr(r.tds)}</div> : null}</div>) },
     { key: "method", header: "Method" },
     { key: "upiId", header: "UPI/Account", render: (r) => r.upiId || r.bankAccount || "—" },
-    { key: "status", header: "Status", render: (r) => <StatusBadge value={r.status} /> },
+    { key: "status", header: "Status", render: (r) => <StatusBadge value={up(r.status)} /> },
     { key: "createdAt", header: "Date", render: (r) => fmtDate(r.createdAt) },
     { key: "actions", header: "", align: "right", render: (r) => (
-      r.status === "PENDING" ? (
+      up(r.status) === "PENDING" ? (
         <div className="flex items-center gap-1 justify-end">
           <button onClick={() => wAction(r.id, "approve")} className="p-1.5 rounded-md hover:bg-emerald-50 text-emerald-600 border border-emerald-200" title="Approve"><Check size={13} /></button>
           <button onClick={() => wAction(r.id, "reject")} className="p-1.5 rounded-md hover:bg-rose-50 text-rose-600 border border-rose-200" title="Reject"><X size={13} /></button>
         </div>
-      ) : r.status === "APPROVED" ? (
+      ) : up(r.status) === "APPROVED" ? (
         <button onClick={() => wAction(r.id, "mark-paid")} className="text-[11.5px] px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">Mark Paid</button>
       ) : <span className="text-[11px] text-slate-400">—</span>
     )},
@@ -78,7 +80,7 @@ export default function SellerManagement() {
     )},
   ];
 
-  const pendingW = withdrawals.filter(w => w.status === "PENDING").length;
+  const pendingW = withdrawals.filter(w => up(w.status) === "PENDING").length;
   const pendingR = returns.filter(r => r.status === "PENDING").length;
 
   return (

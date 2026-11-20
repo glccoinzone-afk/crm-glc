@@ -2753,6 +2753,58 @@ async def call_glczone_bridge(path: str, data: dict):
         return {"error": True, "message": f"Could not reach glczone.in: {e}"}
 
 
+@api.post("/webhooks/withdrawal-event")
+async def withdrawal_webhook(request: Request):
+    """glczone.in calls this when a member asks for a withdrawal and after every change of it (approved, rejected, paid, on the website or here).
+    One CRM row per withdrawal_id; sending it again refreshes it. While the CRM itself is working on a row ("processing") the status is not
+    overwritten, so a click here is never undone by an older message. Same shared secret as the other webhooks."""
+    secret = request.headers.get("X-Crm-Bridge-Secret", "")
+    expected = os.getenv("CRM_BRIDGE_SECRET", "")
+    if not expected or not hmac.compare_digest(secret.encode(), expected.encode()):
+        raise HTTPException(401, "Unauthorized")
+    body = await request.json()
+    wid = str(body.get("withdrawal_id", "")).strip()
+    if not wid:
+        raise HTTPException(400, "withdrawal_id is required")
+    status_ = str(body.get("status") or "pending").lower()
+    status_ = status_ if status_ in ("pending", "approved", "rejected", "paid") else "pending"
+
+    def num(k):
+        try:
+            return float(body.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    data = {
+        "glczone_withdrawal_id": wid,
+        "glczone_user_id": str(body.get("user_id") or ""),
+        "sellerName": str(body.get("name") or "Member").strip(),
+        "mobile": str(body.get("mobile") or "").strip() or None,
+        "email": str(body.get("email") or "").strip() or None,
+        "wallet": str(body.get("wallet") or "cash"),
+        "method": f"{str(body.get('wallet') or 'cash').title()} wallet",
+        "amount": round(num("amount"), 2),
+        "tds": round(num("tds"), 2),
+        "netAmount": round(num("net_amount"), 2),
+        "upiId": str(body.get("payment_address") or "").strip() or None,
+        "adminNote": str(body.get("admin_note") or "").strip() or None,
+        "paymentReference": str(body.get("payment_reference") or "").strip() or None,
+        "requestedAt": body.get("requested_at") or None,
+        "processedAt": body.get("processed_at") or None,
+        "updatedAt": now_iso(),
+    }
+    existing = await db.withdrawals.find_one({"glczone_withdrawal_id": wid}, {"_id": 0, "id": 1, "status": 1})
+    if existing:
+        if (existing.get("status") or "").lower() != "processing":
+            data["status"] = status_
+        await db.withdrawals.update_one({"glczone_withdrawal_id": wid}, {"$set": data})
+        return {"ok": True, "id": existing["id"], "created": False}
+    data.update({"id": uid(), "status": status_, "createdAt": body.get("requested_at") or now_iso()})
+    await db.withdrawals.insert_one(data)
+    log.info(f"Withdrawal received: {wid} ({data['sellerName']} {data['amount']})")
+    return {"ok": True, "id": data["id"], "created": True}
+
+
 _PENDING = ["pending", "PENDING"]
 
 
@@ -5532,7 +5584,7 @@ async def ensure_indexes():
         ("deliveries", [("glczone_order_id", 1)], {}),
         ("products", [("id", 1)], {"unique": True}), ("stock_items", [("productId", 1)], {}),
         ("purchase_orders", [("poNo", 1)], {"unique": True, **_present("poNo")}), ("tickets", [("ticketNo", 1)], {"unique": True, **_present("ticketNo")}),
-        ("withdrawals", [("id", 1)], {}), ("returns", [("id", 1)], {}),
+        ("withdrawals", [("id", 1)], {}), ("withdrawals", [("glczone_withdrawal_id", 1)], {"unique": True, **_present("glczone_withdrawal_id")}), ("returns", [("id", 1)], {}),
         ("business_accounts", [("glczone_business_id", 1)], {"unique": True}), ("business_accounts", [("status", 1)], {}),
         ("ocm_contacts", [("phone", 1)], {}), ("ocm_contacts", [("whatsappId", 1)], {}),
         ("ocm_conversations", [("contactId", 1)], {}), ("ocm_conversations", [("lastMessageAt", -1)], {}),
