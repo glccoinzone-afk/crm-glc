@@ -10,7 +10,6 @@ import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Leads from "@/pages/crm/Leads";
 import Customers from "@/pages/crm/Customers";
-import BusinessAccounts from "@/pages/crm/BusinessAccounts";
 import Customer360 from "@/pages/crm/Customer360";
 import Pipeline from "@/pages/crm/Pipeline";
 import Quotations from "@/pages/crm/Quotations";
@@ -74,7 +73,6 @@ function AppRoutes() {
       <Route path="/" element={<Guard module="dashboard"><Dashboard /></Guard>} />
       <Route path="/crm/leads" element={<Guard module="crm.leads"><Leads /></Guard>} />
       <Route path="/crm/customers" element={<Guard module="crm.customers"><Customers /></Guard>} />
-      <Route path="/crm/business" element={<Guard module="crm.customers"><BusinessAccounts /></Guard>} />
       <Route path="/crm/customers/:id" element={<Guard module="crm.customers"><Customer360 /></Guard>} />
       <Route path="/crm/pipeline" element={<Guard module="crm.pipeline"><Pipeline /></Guard>} />
       <Route path="/crm/quotations" element={<Guard module="crm.quotations"><Quotations /></Guard>} />
