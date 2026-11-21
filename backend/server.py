@@ -2639,94 +2639,6 @@ async def career_lead_inbox_webhook(request: Request):
     return {"ok": True, "conversationId": conv["id"], "contactId": contact["id"], "created": created}
 
 
-# ===================== GLC BUSINESS (bulk buyers) =====================
-
-_BIZ_STATUSES = ("pending", "approved", "rejected")
-
-
-@api.post("/webhooks/business-event")
-async def business_webhook(request: Request):
-    """glczone.in calls this when a restaurant / hotel / mess registers on the GLC Business page, is approved or rejected, asks for a rate,
-    or places a bulk order. One CRM record per website business account (business_id); sending the same one again only refreshes it.
-    Same shared secret as the other webhooks."""
-    secret = request.headers.get("X-Crm-Bridge-Secret", "")
-    expected = os.getenv("CRM_BRIDGE_SECRET", "")
-    if not expected or not hmac.compare_digest(secret.encode(), expected.encode()):
-        raise HTTPException(401, "Unauthorized")
-    body = await request.json()
-    biz_id = str(body.get("business_id", "")).strip()
-    name = str(body.get("business_name", "")).strip()
-    if not biz_id or not name:
-        raise HTTPException(400, "business_id and business_name are required")
-    status_ = str(body.get("status") or "pending").lower()
-    status_ = status_ if status_ in _BIZ_STATUSES else "pending"
-
-    def num(k):
-        try:
-            return float(body.get(k) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    data = {
-        "glczone_business_id": biz_id,
-        "glczone_user_id": str(body.get("user_id") or ""),
-        "code": str(body.get("code") or ""),
-        "name": name,
-        "type": str(body.get("business_type") or "other"),
-        "gst": str(body.get("gst_number") or "").strip() or None,
-        "contact": str(body.get("contact_name") or "").strip() or None,
-        "phone": str(body.get("phone") or "").strip() or None,
-        "email": str(body.get("email") or "").strip() or None,
-        "city": str(body.get("city") or "").strip() or None,
-        "notes": str(body.get("notes") or "").strip() or None,
-        "status": status_,
-        "adminNote": str(body.get("admin_note") or "").strip() or None,
-        "orders": int(num("orders")),
-        "spend": round(num("spend"), 2),
-        "saved": round(num("saved"), 2),
-        "lastOrderAt": body.get("last_order_at") or None,
-        "quotesTotal": int(num("quotes_total")),
-        "quotesOpen": int(num("quotes_open")),
-        "lastQuote": body.get("last_quote") or None,
-        "registeredAt": body.get("registered_at") or None,
-        "decidedAt": body.get("decided_at") or None,
-        "updatedAt": now_iso(),
-    }
-    existing = await db.business_accounts.find_one({"glczone_business_id": biz_id}, {"_id": 0, "id": 1, "status": 1})
-    if existing:
-        await db.business_accounts.update_one({"glczone_business_id": biz_id}, {"$set": data})
-        if existing.get("status") != status_:
-            await db.business_accounts.update_one({"glczone_business_id": biz_id}, {"$push": {"activities": {"id": uid(), "text": f"Status: {existing.get('status')} -> {status_}", "by": "glczone.in", "at": now_iso()}}})
-        return {"ok": True, "id": existing["id"], "created": False}
-    data.update({"id": uid(), "createdAt": now_iso(), "activities": [{"id": uid(), "text": f"Business registered on glczone.in ({status_})", "by": "glczone.in", "at": now_iso()}]})
-    await db.business_accounts.insert_one(data)
-    log.info(f"Business account created: {biz_id} ({name})")
-    return {"ok": True, "id": data["id"], "created": True}
-
-
-@api.get("/business-accounts")
-async def list_business_accounts(q: Optional[str] = None, status_: Optional[str] = Query(None, alias="status"), user=Depends(require_module("crm.customers"))):
-    """The GLC Business accounts with what they bought and asked for, plus the numbers for the cards on top."""
-    query: Dict[str, Any] = {}
-    if status_ in _BIZ_STATUSES:
-        query["status"] = status_
-    if q:
-        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
-        query["$or"] = [{"name": rx}, {"contact": rx}, {"phone": rx}, {"email": rx}, {"city": rx}, {"gst": rx}, {"code": rx}]
-    items = await db.business_accounts.find(query, {"_id": 0}).sort("createdAt", -1).to_list(2000)
-    allrows = await db.business_accounts.find({}, {"_id": 0, "status": 1, "orders": 1, "spend": 1, "quotesOpen": 1}).to_list(5000)
-    summary = {
-        "total": len(allrows),
-        "approved": sum(1 for r in allrows if r.get("status") == "approved"),
-        "pending": sum(1 for r in allrows if r.get("status") == "pending"),
-        "rejected": sum(1 for r in allrows if r.get("status") == "rejected"),
-        "orders": sum(int(r.get("orders") or 0) for r in allrows),
-        "spend": round(sum(float(r.get("spend") or 0) for r in allrows), 2),
-        "quotesOpen": sum(int(r.get("quotesOpen") or 0) for r in allrows),
-    }
-    return {"items": items, "summary": summary}
-
-
 # ===================== WITHDRAWALS (Two-way sync with glczone.in) =====================
 
 async def call_glczone_bridge(path: str, data: dict):
@@ -5585,7 +5497,7 @@ async def ensure_indexes():
         ("products", [("id", 1)], {"unique": True}), ("stock_items", [("productId", 1)], {}),
         ("purchase_orders", [("poNo", 1)], {"unique": True, **_present("poNo")}), ("tickets", [("ticketNo", 1)], {"unique": True, **_present("ticketNo")}),
         ("withdrawals", [("id", 1)], {}), ("withdrawals", [("glczone_withdrawal_id", 1)], {"unique": True, **_present("glczone_withdrawal_id")}), ("returns", [("id", 1)], {}),
-        ("business_accounts", [("glczone_business_id", 1)], {"unique": True}), ("business_accounts", [("status", 1)], {}),
+        
         ("ocm_contacts", [("phone", 1)], {}), ("ocm_contacts", [("whatsappId", 1)], {}),
         ("ocm_conversations", [("contactId", 1)], {}), ("ocm_conversations", [("lastMessageAt", -1)], {}),
         ("ocm_messages", [("conversationId", 1), ("createdAt", 1)], {}),

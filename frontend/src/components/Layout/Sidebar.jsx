@@ -25,7 +25,6 @@ const groups = [
     items: [
       { to: "/crm/leads", label: "Leads", icon: UserSquare2, mod: "crm.leads" },
       { to: "/crm/customers", label: "Customers", icon: Users, mod: "crm.customers" },
-      { to: "/crm/business", label: "GLC Business", icon: Building2, mod: "crm.customers" },
       { to: "/crm/pipeline", label: "Sales Pipeline", icon: Kanban, mod: "crm.pipeline" },
       { to: "/crm/quotations", label: "Quotations", icon: FileText, mod: "crm.quotations" },
     ],
